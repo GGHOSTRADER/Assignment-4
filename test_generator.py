@@ -1,8 +1,52 @@
 import json
 import re
+import os
 from typing import Dict, Any
+from dotenv import load_dotenv
+from neo4j import GraphDatabase
 
 from llm_loader import load_local_llm, get_tokenizer, get_raw_pipeline
+
+
+# ========== 0) Initialization ==========
+load_dotenv()
+
+URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+AUTH = (
+    os.getenv("NEO4J_USER", "neo4j"),
+    os.getenv("NEO4J_PASSWORD", "password"),
+)
+
+# Avoid local proxy settings interfering with model/Neo4j access.
+for key in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
+    if key in os.environ:
+        del os.environ[key]
+
+
+try:
+    driver = GraphDatabase.driver(URI, auth=AUTH)
+    driver.verify_connectivity()
+except Exception as e:
+    print(f"⚠️ Neo4j connection warning: {e}")
+    driver = None
+
+# $$$$$$$$ NEW PART $$$$$$$$
+
+if driver is None:
+    print("\n❌ Neo4j driver is NOT connected. Retrieval will return empty results.\n")
+else:
+    print("\n✅ Neo4j driver connected successfully.\n")
+
+    # quick sanity check query
+    try:
+        with driver.session() as session:
+            test = session.run("RETURN 1 AS ok")
+            print("DB test:", [r["ok"] for r in test])
+    except Exception as e:
+        print(f"❌ DB test query failed: {e}")
+
+# $$$$$$$$ NEW PART $$$$$$$$
+
 
 ALLOWED_TYPES = {
     "obligation",
@@ -53,12 +97,14 @@ Read the user input and return exactly one JSON object with these fields:
 Rules:
 - type must be exactly one of:
   obligation, prohibition, permission, penalty, procedure, other
-- action must be exactly 4 words
-- result must be exactly 4 words, or "" if no clear result is stated
+- action must be less than 7 words
+- result must be less than 7 words, or "" if no clear result is stated
 - return JSON only
 - do not include markdown
 - do not include explanations
 - do not include extra keys
+- Do not use short words like mins, use full word like minutes.
+
 
 Example input and output:
 
@@ -260,26 +306,20 @@ def classify_user_input(
 
 from typing import Any
 
+# $$$$$$$$ NEW PART $$$$$$$$
+
 
 def build_typed_cypher(entities: dict[str, Any]) -> tuple[str, str]:
     """
     Build two Cypher queries from already-validated entities JSON.
 
-    Expected input:
-    {
-        "type": "obligation" | "prohibition" | "permission" | "penalty" | "procedure" | "other",
-        "action": "...",
-        "result": "..."
-    }
-
     Branching logic:
     - if action is empty and result is empty: use type only
-    - if action is empty: use type + result
-    - if result is empty: use type + action
-    - else: use type + action + result
+    - if action is empty: use type + result tokens
+    - if result is empty: use type + action tokens
+    - else: use type + action tokens + result tokens
     """
 
-    rule_type = str(entities.get("type", "") or "").strip().lower()
     action = str(entities.get("action", "") or "").strip().lower()
     result = str(entities.get("result", "") or "").strip().lower()
 
@@ -290,8 +330,8 @@ def build_typed_cypher(entities: dict[str, Any]) -> tuple[str, str]:
         cypher_typed = """
 MATCH p = (z:Rule)
 WHERE z.type = $type
-  AND toLower(coalesce(z.action, "")) CONTAINS $action
-  AND toLower(coalesce(z.result, "")) CONTAINS $result
+  AND ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
+  AND ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
 RETURN p,
        z.rule_id AS rule_id,
        z.type AS type,
@@ -307,8 +347,9 @@ LIMIT 10
 MATCH p = (z:Rule)
 WHERE z.type = $type
   AND (
-        toLower(coalesce(z.action, "")) CONTAINS $action
-        OR toLower(coalesce(z.result, "")) CONTAINS $result
+        ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
+        OR
+        ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
       )
 RETURN p,
        z.rule_id AS rule_id,
@@ -318,10 +359,10 @@ RETURN p,
        z.art_ref AS art_ref,
        z.reg_name AS reg_name,
        CASE
-         WHEN toLower(coalesce(z.action, "")) CONTAINS $action
-              AND toLower(coalesce(z.result, "")) CONTAINS $result THEN 3
-         WHEN toLower(coalesce(z.action, "")) CONTAINS $action
-              OR toLower(coalesce(z.result, "")) CONTAINS $result THEN 2
+         WHEN ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
+          AND ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word) THEN 3
+         WHEN ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
+           OR ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word) THEN 2
          ELSE 1
        END AS score
 ORDER BY score DESC, rule_id
@@ -332,7 +373,7 @@ LIMIT 15
         cypher_typed = """
 MATCH p = (z:Rule)
 WHERE z.type = $type
-  AND toLower(coalesce(z.action, "")) CONTAINS $action
+  AND ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
 RETURN p,
        z.rule_id AS rule_id,
        z.type AS type,
@@ -347,7 +388,7 @@ LIMIT 10
         cypher_broad = """
 MATCH p = (z:Rule)
 WHERE z.type = $type
-   OR toLower(coalesce(z.action, "")) CONTAINS $action
+   OR ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
 RETURN p,
        z.rule_id AS rule_id,
        z.type AS type,
@@ -357,9 +398,9 @@ RETURN p,
        z.reg_name AS reg_name,
        CASE
          WHEN z.type = $type
-              AND toLower(coalesce(z.action, "")) CONTAINS $action THEN 2
+          AND ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word) THEN 2
          WHEN z.type = $type
-              OR toLower(coalesce(z.action, "")) CONTAINS $action THEN 1
+           OR ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word) THEN 1
          ELSE 0
        END AS score
 ORDER BY score DESC, rule_id
@@ -370,7 +411,7 @@ LIMIT 15
         cypher_typed = """
 MATCH p = (z:Rule)
 WHERE z.type = $type
-  AND toLower(coalesce(z.result, "")) CONTAINS $result
+  AND ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
 RETURN p,
        z.rule_id AS rule_id,
        z.type AS type,
@@ -385,7 +426,7 @@ LIMIT 10
         cypher_broad = """
 MATCH p = (z:Rule)
 WHERE z.type = $type
-   OR toLower(coalesce(z.result, "")) CONTAINS $result
+   OR ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
 RETURN p,
        z.rule_id AS rule_id,
        z.type AS type,
@@ -395,9 +436,9 @@ RETURN p,
        z.reg_name AS reg_name,
        CASE
          WHEN z.type = $type
-              AND toLower(coalesce(z.result, "")) CONTAINS $result THEN 2
+          AND ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word) THEN 2
          WHEN z.type = $type
-              OR toLower(coalesce(z.result, "")) CONTAINS $result THEN 1
+           OR ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word) THEN 1
          ELSE 0
        END AS score
 ORDER BY score DESC, rule_id
@@ -437,11 +478,62 @@ LIMIT 15
     return cypher_typed, cypher_broad
 
 
+# $$$$$$$$ NEW PART $$$$$$$$
+
+# $$$$$$$$ NEW PART $$$$$$$$
+
+STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "of",
+    "to",
+    "from",
+    "than",
+    "more",
+    "less",
+    "be",
+    "is",
+    "are",
+    "was",
+    "were",
+    "x",
+    "will",
+    "shall",
+    "should",
+    "can",
+    "could",
+}
+
+
+def tokenize_for_retrieval(text: str) -> list[str]:
+    tokens = re.findall(r"\b[\w'-]+\b", text.lower())
+    return [t for t in tokens if len(t) > 2 and t not in STOPWORDS]
+
+
+# $$$$$$$$ NEW PART $$$$$$$$
+
+
 def build_typed_params(entities: dict[str, Any]) -> dict[str, Any]:
+    # $$$$$$$$ NEW PART $$$$$$$$
+    action_tokens = tokenize_for_retrieval(entities["action"])
+    result_tokens = tokenize_for_retrieval(entities["result"])
+
+    print("\n=== TOKEN DEBUG ===")
+    print("Raw action:", entities["action"])
+    print("Action tokens:", action_tokens)
+    print("Raw result:", entities["result"])
+    print("Result tokens:", result_tokens)
+    # $$$$$$$$ NEW PART $$$$$$$$
+
     return {
         "type": entities["type"].strip().lower(),
-        "action": entities["action"].strip().lower(),
-        "result": entities["result"].strip().lower(),
+        # $$$$$$$$ NEW PART $$$$$$$$
+        "action_tokens": action_tokens,
+        "result_tokens": result_tokens,
+        # $$$$$$$$ NEW PART $$$$$$$$
     }
 
 
@@ -533,6 +625,147 @@ def validate_or_repair(data: Dict[str, Any]) -> Dict[str, Any]:
     return repaired_data
 
 
+# $$$$$$$$ NEW PART $$$$$$$$
+
+
+def _tokenize_for_overlap(text: str) -> set[str]:
+    if not text:
+        return set()
+    return set(re.findall(r"\b[\w'-]+\b", text.lower()))
+
+
+def _compute_python_rank(row: dict[str, Any], entities: dict[str, Any]) -> int:
+    """
+    Python-side reranking.
+
+    Score components:
+    - typed source gets a strong boost
+    - DB score still matters
+    - token overlap on action/result refines ranking
+    """
+    source = str(row.get("source", "") or "").strip().lower()
+    db_score = int(row.get("score", 0) or 0)
+
+    query_action_tokens = _tokenize_for_overlap(str(entities.get("action", "") or ""))
+    query_result_tokens = _tokenize_for_overlap(str(entities.get("result", "") or ""))
+
+    row_action_tokens = _tokenize_for_overlap(str(row.get("action", "") or ""))
+    row_result_tokens = _tokenize_for_overlap(str(row.get("result", "") or ""))
+
+    action_overlap = len(query_action_tokens & row_action_tokens)
+    result_overlap = len(query_result_tokens & row_result_tokens)
+
+    source_boost = 100 if source == "typed" else 0
+
+    return (
+        source_boost + (30 * db_score) + (10 * action_overlap) + (10 * result_overlap)
+    )
+
+
+def _run_query_with_source(
+    query: str,
+    params: dict[str, Any],
+    source: str,
+) -> list[dict[str, Any]]:
+    """
+    Run one Cypher query and tag each row with its source.
+    """
+    if driver is None:
+        return []
+
+    with driver.session() as session:
+        records = session.run(query, params)
+        rows = [dict(record) for record in records]
+
+    for row in rows:
+        row["source"] = source
+
+    return rows
+
+
+def _merge_ranked_results(
+    typed_rows: list[dict[str, Any]],
+    broad_rows: list[dict[str, Any]],
+    entities: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """
+    Merge duplicates by rule_id and keep the higher-ranked version.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+
+    for row in typed_rows + broad_rows:
+        rule_id = str(row.get("rule_id", "") or "").strip()
+        if not rule_id:
+            continue
+
+        row["python_rank"] = _compute_python_rank(row, entities)
+
+        if rule_id not in merged:
+            merged[rule_id] = row
+            continue
+
+        if row["python_rank"] > merged[rule_id]["python_rank"]:
+            merged[rule_id] = row
+
+    return sorted(
+        merged.values(),
+        key=lambda x: (
+            x.get("python_rank", 0),
+            x.get("score", 0),
+            x.get("rule_id", ""),
+        ),
+        reverse=True,
+    )
+
+
+def get_relevant_articles(
+    entities: dict[str, Any],
+    typed_query: str,
+    broad_query: str,
+    params: dict[str, Any],
+    top_k: int = 10,
+) -> list[dict[str, Any]]:
+    """
+    Run typed+broad retrieval, tag source, rank in Python, merge duplicates,
+    and return top-k rows.
+    """
+    if driver is None:
+        return []
+
+    print("\n=== RETRIEVAL INPUT ENTITIES ===")
+    print(json.dumps(entities, indent=2, ensure_ascii=False))
+
+    print("\n=== RETRIEVAL PARAMS ===")
+    print(json.dumps(params, indent=2, ensure_ascii=False))
+
+    print("\n=== RUNNING TYPED QUERY ===")
+    typed_rows = _run_query_with_source(typed_query, params, source="typed")
+    print(f"Typed hits: {len(typed_rows)}")
+
+    print("\n=== RUNNING BROAD QUERY ===")
+    broad_rows = _run_query_with_source(broad_query, params, source="broad")
+    print(f"Broad hits: {len(broad_rows)}")
+
+    ranked_rows = _merge_ranked_results(typed_rows, broad_rows, entities)
+
+    print("\n=== FINAL RANKED RESULTS ===")
+    for idx, row in enumerate(ranked_rows[:top_k], start=1):
+        print(
+            f"[{idx}] "
+            f"rule_id={row.get('rule_id')} | "
+            f"source={row.get('source')} | "
+            f"db_score={row.get('score')} | "
+            f"python_rank={row.get('python_rank')} | "
+            f"type={row.get('type')} | "
+            f"art_ref={row.get('art_ref')}"
+        )
+
+    return ranked_rows[:top_k]
+
+
+# $$$$$$$$ NEW PART $$$$$$$$
+
+
 if __name__ == "__main__":
     profile = (
         "Classify the user request into exactly one legal-style category "
@@ -568,3 +801,18 @@ if __name__ == "__main__":
 
     print("\nParams:")
     print(params)
+
+    # $$$$$$$$ NEW PART $$$$$$$$
+
+    relevant_rules = get_relevant_articles(
+        entities=entities,
+        typed_query=typed_query,
+        broad_query=broad_query,
+        params=params,
+        top_k=10,
+    )
+
+    print("\nRelevant rules:")
+    print(json.dumps(relevant_rules, indent=2, ensure_ascii=False, default=str))
+
+# $$$$$$$$ NEW PART $$$$$$$$
