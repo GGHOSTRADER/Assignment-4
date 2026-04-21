@@ -60,12 +60,39 @@ Rules:
 - do not include explanations
 - do not include extra keys
 
-Example output:
+Example input and output:
+
+Example 1
+User input:
+What is the penalty for being late to class?
+System Output:
+{{
+  "type": "penalty",
+  "action": be late to class,
+  "result": receive a penalty
+}}
+
+Example 2
+User input:
+How can I renew my ID card?
+System Output:
 {{
   "type": "procedure",
-  "action": "explain passport renewal steps",
-  "result": "complete passport renewal process"
+  "action": steps to renew ID,
+  "result": Get new ID card
 }}
+
+
+Example 3
+User input:
+What happens if I dont pay my tuition?
+System Output:
+{{
+  "type": "penalty",
+  "action": not paying tuition,
+  "result": consecuencess.
+}}
+
 
 User input:
 {user_input}
@@ -124,28 +151,75 @@ def validate_output(data: Dict[str, Any]) -> None:
     required_keys = {"type", "action", "result"}
     actual_keys = set(data.keys())
 
+    print("\n--- VALIDATION START ---")  # $$$$$$$$ NEW PART $$$$$$$$
+
     missing = required_keys - actual_keys
     extra = actual_keys - required_keys
 
+    print(f"[CHECK] keys present: {actual_keys}")  # $$$$$$$$ NEW PART $$$$$$$$
+
     if missing:
+        print(f"[FAIL] missing keys: {missing}")  # $$$$$$$$ NEW PART $$$$$$$$
         raise ValueError(f"Missing keys: {sorted(missing)}")
+    else:
+        print("[PASS] required keys present")  # $$$$$$$$ NEW PART $$$$$$$$
+
     if extra:
+        print(f"[FAIL] unexpected keys: {extra}")  # $$$$$$$$ NEW PART $$$$$$$$
         raise ValueError(f"Unexpected keys: {sorted(extra)}")
+    else:
+        print("[PASS] no extra keys")  # $$$$$$$$ NEW PART $$$$$$$$
 
     if not isinstance(data["type"], str):
+        print(
+            f"[FAIL] type is not string: {data['type']}"
+        )  # $$$$$$$$ NEW PART $$$$$$$$
         raise ValueError("type must be a string")
-    if data["type"] not in ALLOWED_TYPES:
+
+    type_value = data["type"].strip().lower()
+    print(f"[CHECK] type value: '{type_value}'")  # $$$$$$$$ NEW PART $$$$$$$$
+
+    if type_value not in ALLOWED_TYPES:
+        print(f"[FAIL] invalid type: '{type_value}'")  # $$$$$$$$ NEW PART $$$$$$$$
         raise ValueError(f"type must be one of: {sorted(ALLOWED_TYPES)}")
+    else:
+        print("[PASS] type is valid")  # $$$$$$$$ NEW PART $$$$$$$$
 
     if not isinstance(data["action"], str):
+        print(
+            f"[FAIL] action not string: {data['action']}"
+        )  # $$$$$$$$ NEW PART $$$$$$$$
         raise ValueError("action must be a string")
-    if count_words(data["action"]) > 6:
-        raise ValueError("action must be less than 7 words ")
+
+    action_wc = count_words(data["action"])
+    print(
+        f"[CHECK] action: '{data['action']}' | words={action_wc}"
+    )  # $$$$$$$$ NEW PART $$$$$$$$
+
+    if action_wc > 6:
+        print("[FAIL] action too long")  # $$$$$$$$ NEW PART $$$$$$$$
+        raise ValueError("action must contain fewer than 7 words")
+    else:
+        print("[PASS] action word count valid")  # $$$$$$$$ NEW PART $$$$$$$$
 
     if not isinstance(data["result"], str):
+        print(
+            f"[FAIL] result not string: {data['result']}"
+        )  # $$$$$$$$ NEW PART $$$$$$$$
         raise ValueError("result must be a string")
-    if data["result"] != "" and count_words(data["result"]) > 6:
-        raise ValueError('result less than 7 words or be ""')
+
+    result_wc = count_words(data["result"])
+    print(
+        f"[CHECK] result: '{data['result']}' | words={result_wc}"
+    )  # $$$$$$$$ NEW PART $$$$$$$$
+
+    if data["result"] != "" and result_wc > 6:
+        print("[FAIL] result too long")  # $$$$$$$$ NEW PART $$$$$$$$
+        raise ValueError('result must contain fewer than 7 words or be ""')
+    else:
+        print("[PASS] result word count valid")  # $$$$$$$$ NEW PART $$$$$$$$
+
+    print("--- VALIDATION PASSED ---\n")  # $$$$$$$$ NEW PART $$$$$$$$
 
 
 def classify_user_input(
@@ -179,7 +253,7 @@ def classify_user_input(
     print("----------------------\n")
 
     data = parse_json_text(response_text)
-    validate_output(data)
+    data = validate_or_repair(data)
 
     return data
 
@@ -371,6 +445,94 @@ def build_typed_params(entities: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+import json
+from typing import Dict, Any
+
+
+def build_repair_prompt(data: Dict[str, Any]) -> str:
+    ensure_llm_loaded()
+
+    tokenizer = get_tokenizer()
+    messages = [
+        {
+            "role": "system",
+            "content": f"""
+You are a strict JSON repairer.
+
+Task:
+You will receive a JSON object with fields:
+- type
+- action
+- result
+
+Your job is to rewrite it so it passes the schema rules below.
+
+Schema rules:
+- Output must remain a JSON object with exactly these keys:
+  - type
+  - action
+  - result
+- type must be exactly one of:
+  obligation, prohibition, permission, penalty, procedure, other
+- If type is invalid, replace it with the closest valid type.
+- action must contain fewer than 6 words.
+- result must contain fewer than 6 words, or be "".
+- Keep the meaning as close as possible.
+- Do not add extra keys.
+- Return JSON only.
+- Do not use markdown.
+- Do not explain.
+
+Input JSON:
+{json.dumps(data, ensure_ascii=False, indent=2)}
+""".strip(),
+        }
+    ]
+
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+
+def repair_with_llm(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Send invalid parsed data to the LLM and ask it to rewrite the JSON
+    so it passes validation.
+    """
+    prompt = build_repair_prompt(data)
+    response_text = call_llm_once(prompt)
+
+    print("\n--- REPAIR PROMPT SENT TO LLM ---")
+    print(prompt)
+    print("---------------------------------\n")
+
+    print("\n--- RAW REPAIRED LLM OUTPUT ---")
+    print(response_text)
+    print("-------------------------------\n")
+
+    repaired_data = parse_json_text(response_text)
+    return repaired_data
+
+
+def validate_or_repair(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    First try normal validation.
+    If ValueError happens, repair with LLM and validate again.
+    """
+    try:
+        validate_output(data)
+        return data
+    except ValueError as e:
+        print(f"\nValidation failed: {e}")
+        print("Attempting LLM repair...\n")
+
+    repaired_data = repair_with_llm(data)
+    validate_output(repaired_data)
+    return repaired_data
+
+
 if __name__ == "__main__":
     profile = (
         "Classify the user request into exactly one legal-style category "
@@ -386,7 +548,7 @@ if __name__ == "__main__":
 """.strip()
 
     output = classify_user_input(
-        user_input="How many minutes late can a student be before they are barred from the exam?",
+        user_input="How many minutes late can a student be before they are barred from the exam? since I will be running late this morning and I dont wanna miss more classes.",
         profile=profile,
         schema_description=schema_description,
     )
