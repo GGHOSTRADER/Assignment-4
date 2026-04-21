@@ -50,7 +50,7 @@ Extract rules from the regulation text below.
 
 Field definitions:
 - type: choose exactly one of:
-  obligation, prohibition, permission, penalty, procedure, other
+  eligibility, requirement, prohibition, permission, process, penalty , exception , calculation , definition
 - action: the main behavior, requirement, restriction, or allowed act described in the text
 - result: the consequence, outcome, punishment, or follow-up stated in the text; use "" if none is stated
 
@@ -196,7 +196,7 @@ def build_fallback_rules(article_number: str, content: str) -> List[Dict[str, st
 
     Improvements:
     - supports all target types:
-      obligation, prohibition, permission, penalty, procedure, other
+      eligibility, requirement, prohibition, permission, process, penalty , exception , calculation , definition"
     - avoids overwriting a pending action before saving it
     - flushes final pending action at the end
     - allows penalty sentences to attach to the previous action

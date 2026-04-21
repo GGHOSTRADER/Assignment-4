@@ -1,4 +1,3 @@
-# auto_test.py
 import os
 import sys
 from pathlib import Path
@@ -17,9 +16,27 @@ TEST_DATA_PATH = ROOT_DIR / "test_data.json"
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from query_system import get_relevant_articles, generate_answer, generate_text
+# $$$$ NEW CODE $$$$
+from query_system import answer_question, generate_text
+
+# $$$$ NEW CODE $$$$
 
 load_dotenv()
+
+# $$$$ NEW CODE $$$$
+PROFILE = (
+    "Classify the user request into exactly one legal-style category "
+    "and summarize the action and result under the required schema."
+)
+
+SCHEMA_DESCRIPTION = """
+{
+  "type": "choose exactly one of: obligation, prohibition, permission, penalty, procedure, other",
+  "action": "6 or less words",
+  "result": "6 or less words, if not possible use empty string"
+}
+""".strip()
+# $$$$ NEW CODE $$$$
 
 
 def preflight_checks() -> bool:
@@ -57,13 +74,16 @@ def preflight_checks() -> bool:
 
 
 def ask_bot_no_metadata(question):
-    """Retrieve relevant articles without relying on metadata, then generate an answer."""
+    """Run the full QA pipeline exposed by query_system.py."""
     try:
-        # Directly retrieve articles without metadata dependency
-        articles = get_relevant_articles(question)
-        print("[?] Retrieved Articles for Question (No Metadata):", articles)
-        final_answer = generate_answer(question, articles)
+        # $$$$ NEW CODE $$$$
+        final_answer = answer_question(
+            user_q=question,
+            profile=PROFILE,
+            schema_description=SCHEMA_DESCRIPTION,
+        )
         return final_answer
+        # $$$$ NEW CODE $$$$
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -85,9 +105,9 @@ def evaluate_with_llm(question, expected, actual):
                 f"Actual Answer from Bot: {actual}\n\n"
                 "Does the Actual Answer convey the same key information as the Expected Answer?\n"
                 "Rules:\n"
-                "1. If the bot says it cannot find information or gives a wrong number/fact → FAIL.\n"
-                "2. Minor wording differences (e.g. '20 mins' vs 'twenty minutes') → PASS.\n"
-                "3. More detail than expected but the core fact is correct → PASS.\n"
+                "1. If the bot says it cannot find information or gives a wrong number/fact -> FAIL.\n"
+                "2. Minor wording differences (e.g. '20 minutes' vs 'twenty minutes') -> PASS.\n"
+                "3. More detail than expected but the core fact is correct -> PASS.\n"
                 "Answer with one word only: PASS or FAIL."
             ),
         },
@@ -95,9 +115,26 @@ def evaluate_with_llm(question, expected, actual):
 
     try:
         text = generate_text(messages).strip()
-        if "PASS" in text.upper():
+
+        # $$$$ NEW CODE $$$$
+        # More robust judge extraction in case the local model echoes the prompt
+        upper_text = text.upper()
+        if "FAIL" in upper_text and "PASS" not in upper_text:
+            return "FAIL"
+        if "PASS" in upper_text and "FAIL" not in upper_text:
             return "PASS"
+
+        # fallback: inspect last non-empty line
+        lines = [line.strip().upper() for line in text.splitlines() if line.strip()]
+        if lines:
+            last = lines[-1]
+            if "PASS" in last:
+                return "PASS"
+            if "FAIL" in last:
+                return "FAIL"
+
         return "FAIL"
+        # $$$$ NEW CODE $$$$
     except Exception as e:
         return f"FAIL (Judge Error: {str(e)})"
 
@@ -152,7 +189,7 @@ def run_llm_evaluation_no_metadata():
         )
 
     print("\n" + "=" * 30)
-    print(f"=== Evaluation Summary (No Metadata) ===")
+    print("=== Evaluation Summary (No Metadata) ===")
     print(f"Total: {len(test_cases)}")
     print(f"Passed: {passed_count}")
     print(f"Failed: {len(test_cases) - passed_count}")
