@@ -104,6 +104,8 @@ Rules:
 - do not include explanations
 - do not include extra keys
 - Do not use short words like mins, use full word like minutes.
+- Every JSON string value must be wrapped in double quotes
+- Output must be valid JSON parsable by Python json.loads
 
 
 Example input and output:
@@ -114,8 +116,8 @@ What is the penalty for being late to class?
 System Output:
 {{
   "type": "penalty",
-  "action": be late to class,
-  "result": receive a penalty
+  "action": "be late to class",
+  "result": "receive a penalty"
 }}
 
 Example 2
@@ -124,8 +126,8 @@ How can I renew my ID card?
 System Output:
 {{
   "type": "procedure",
-  "action": steps to renew ID,
-  "result": Get new ID card
+  "action": "steps to renew ID",
+  "result": "Get new ID card"
 }}
 
 
@@ -135,8 +137,8 @@ What happens if I dont pay my tuition?
 System Output:
 {{
   "type": "penalty",
-  "action": not paying tuition,
-  "result": consecuencess.
+  "action": "not paying tuition",
+  "result": "consecuencess".
 }}
 
 
@@ -766,7 +768,124 @@ def get_relevant_articles(
 # $$$$$$$$ NEW PART $$$$$$$$
 
 
+# $$$$$$$$ NEW PART $$$$$$$$
+
+
+def _format_rules_for_generation(
+    rule_results: list[dict[str, Any]], max_rules: int = 5
+) -> str:
+    """
+    Turn retrieved rule dicts into compact text context for the generator.
+    """
+    lines = []
+
+    for i, rule in enumerate(rule_results[:max_rules], start=1):
+        lines.append(
+            f"""Rule {i}:
+- rule_id: {rule.get("rule_id", "")}
+- reg_name: {rule.get("reg_name", "")}
+- art_ref: {rule.get("art_ref", "")}
+- type: {rule.get("type", "")}
+- action: {rule.get("action", "")}
+- result: {rule.get("result", "")}
+- source: {rule.get("source", "")}
+- retrieval_score: {rule.get("python_rank", "")}
+"""
+        )
+
+    return "\n".join(lines)
+
+
+# $$$$$$$$ NEW PART $$$$$$$$
+
+
+def generate_text(messages: list[dict[str, str]], max_new_tokens: int = 220) -> str:
+    """
+    Call local HF model via chat template + raw pipeline.
+
+    Interface:
+    - Input:
+      - messages: list[dict[str, str]] (chat messages with role/content)
+      - max_new_tokens: int
+    - Output:
+      - str (model generated text, no JSON guarantee)
+    """
+    tok = get_tokenizer()
+    pipe = get_raw_pipeline()
+
+    if tok is None or pipe is None:
+        load_local_llm()
+        tok = get_tokenizer()
+        pipe = get_raw_pipeline()
+
+    prompt = tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    return pipe(prompt, max_new_tokens=max_new_tokens)[0]["generated_text"].strip()
+
+
+# $$$$$$$$ NEW PART $$$$$$$$
+
+
+def generate_answer(question: str, rule_results: list[dict[str, Any]]) -> str:
+    """
+    Generate a final answer from retrieved KG rule results.
+
+    Behavior:
+    - If no rules are retrieved, return a fallback answer.
+    - Otherwise, ask the local model to answer using only the provided rules.
+    """
+    if not rule_results:
+        return "I don't know based on the retrieved rules."
+
+    rules_context = _format_rules_for_generation(rule_results, max_rules=5)
+
+    messages = [
+        {
+            "role": "system",
+            "content": """
+You are a careful regulation QA assistant.
+
+- Answer the user's question using ONLY the retrieved rules provided.
+Do not invent facts.
+- If the rule gives a partial answer, explain the limitation
+- Do NOT default to "I don't know" if some relevant rule exists
+- Only say "I don't know" if no relevant rule exists at all
+
+Instructions:
+- Prefer the highest-ranked and most directly relevant rule.
+- If multiple rules are relevant, synthesize them briefly.
+- Cite the supporting source at the end in this format:
+  [Source: <reg_name>, <art_ref>]
+- If more than one source is used, include multiple citations.
+- Be concise and direct.
+""".strip(),
+        },
+        {
+            "role": "user",
+            "content": f"""
+Question:
+{question}
+
+Retrieved rules:
+{rules_context}
+
+Write the final answer.
+""".strip(),
+        },
+    ]
+
+    answer = generate_text(messages, max_new_tokens=220)
+    return answer.strip()
+
+
+# $$$$$$$$ NEW PART $$$$$$$$
+
+
 if __name__ == "__main__":
+
+    question = "Can I  leave an exam early if I finish ahead of time?"
     profile = (
         "Classify the user request into exactly one legal-style category "
         "and summarize the action and result under the required schema."
@@ -781,7 +900,7 @@ if __name__ == "__main__":
 """.strip()
 
     output = classify_user_input(
-        user_input="How many minutes late can a student be before they are barred from the exam? since I will be running late this morning and I dont wanna miss more classes.",
+        user_input=question,
         profile=profile,
         schema_description=schema_description,
     )
@@ -814,5 +933,17 @@ if __name__ == "__main__":
 
     print("\nRelevant rules:")
     print(json.dumps(relevant_rules, indent=2, ensure_ascii=False, default=str))
+
+    # $$$$$$$$ NEW PART $$$$$$$$
+
+    # $$$$$$$$ NEW PART $$$$$$$$
+
+    final_answer = generate_answer(
+        question=question,
+        rule_results=relevant_rules,
+    )
+
+    print("\nFinal answer:")
+    print(final_answer)
 
 # $$$$$$$$ NEW PART $$$$$$$$
