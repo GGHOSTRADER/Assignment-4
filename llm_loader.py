@@ -1,3 +1,4 @@
+# llm_loader.py
 """
 llm_loader.py
 -------------
@@ -19,12 +20,14 @@ from typing import Any
 
 # ── Configuration ────────────────────────────────────────────────────────────
 MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
-MODEL_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_model_cache")
+MODEL_CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "hf_model_cache"
+)
 MAX_NEW_TOKENS = 512
 # ─────────────────────────────────────────────────────────────────────────────
 
 _llm_instance = None  # singleton – load once per process
-_tokenizer    = None  # exposed so callers can use apply_chat_template
+_tokenizer = None  # exposed so callers can use apply_chat_template
 _raw_pipeline = None  # raw HuggingFace pipeline (not LangChain-wrapped)
 
 
@@ -40,12 +43,14 @@ def load_local_llm(model_id: str = MODEL_ID) -> Any:
         return _llm_instance
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype  = torch.float16 if torch.cuda.is_available() else torch.float32
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
     os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 
     print(f"[Loading] model '{model_id}' ...")
-    if os.path.exists(os.path.join(MODEL_CACHE_DIR, "models--" + model_id.replace("/", "--"))):
+    if os.path.exists(
+        os.path.join(MODEL_CACHE_DIR, "models--" + model_id.replace("/", "--"))
+    ):
         print("   (found in local cache - no download needed)")
     else:
         print(f"   First run: downloading to '{MODEL_CACHE_DIR}' ...")
@@ -69,9 +74,9 @@ def load_local_llm(model_id: str = MODEL_ID) -> Any:
         model=model,
         tokenizer=_tokenizer,
         max_new_tokens=MAX_NEW_TOKENS,
-        do_sample=False,          # deterministic (equivalent to temperature=0)
+        do_sample=False,  # deterministic (equivalent to temperature=0)
         repetition_penalty=1.1,
-        return_full_text=False,   # only return the newly generated tokens
+        return_full_text=False,  # only return the newly generated tokens
     )
 
     _llm_instance = _raw_pipeline

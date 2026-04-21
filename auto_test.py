@@ -1,7 +1,9 @@
+# auto_test.py
 import os
 import sys
 from pathlib import Path
-for key in ['http_proxy', 'https_proxy', 'all_proxy', 'HTTP_PROXY', 'HTTPS_PROXY']:
+
+for key in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY"]:
     if key in os.environ:
         del os.environ[key]
 
@@ -45,11 +47,14 @@ def preflight_checks() -> bool:
         return False
 
     if count == 0:
-        print("[X] Error: Neo4j has 0 Rule nodes. Please run setup_data.py and build_kg.py first.")
+        print(
+            "[X] Error: Neo4j has 0 Rule nodes. Please run setup_data.py and build_kg.py first."
+        )
         return False
 
     print(f"[OK] Preflight passed: Neo4j connected, Rule nodes = {count}")
     return True
+
 
 def ask_bot_no_metadata(question):
     """Retrieve relevant articles without relying on metadata, then generate an answer."""
@@ -61,6 +66,7 @@ def ask_bot_no_metadata(question):
         return final_answer
     except Exception as e:
         return f"Error: {str(e)}"
+
 
 def evaluate_with_llm(question, expected, actual):
     messages = [
@@ -95,6 +101,7 @@ def evaluate_with_llm(question, expected, actual):
     except Exception as e:
         return f"FAIL (Judge Error: {str(e)})"
 
+
 def run_llm_evaluation_no_metadata():
     if not preflight_checks():
         return
@@ -106,8 +113,10 @@ def run_llm_evaluation_no_metadata():
         print("[X] Error: test_data.json not found!")
         return
 
-    print(f"[*] Starting LLM-based Evaluation (No Metadata) for {len(test_cases)} Questions...\n")
-    
+    print(
+        f"[*] Starting LLM-based Evaluation (No Metadata) for {len(test_cases)} Questions...\n"
+    )
+
     passed_count = 0
     results_log = []
 
@@ -115,39 +124,42 @@ def run_llm_evaluation_no_metadata():
         qid = case["id"]
         question = case["question"]
         expected_answer = case["answer"]
-        
+
         print(f"Testing Q{qid}: {question}")
-        
+
         start_time = time.time()
         bot_answer = ask_bot_no_metadata(question)
-        
+
         verdict = evaluate_with_llm(question, expected_answer, bot_answer)
         duration = time.time() - start_time
-        
+
         status_icon = "[OK]" if "PASS" in verdict else "[FAIL]"
         if "PASS" in verdict:
             passed_count += 1
-            
+
         print(f"  -> Bot Says: {bot_answer.strip()}")
         print(f"  -> Judge: {status_icon} {verdict} (Time: {duration:.2f}s)")
         print("-" * 50)
-        
-        results_log.append({
-            "id": qid,
-            "question": question,
-            "expected": expected_answer,
-            "bot_response": bot_answer,
-            "result": verdict
-        })
 
-    print("\n" + "="*30)
+        results_log.append(
+            {
+                "id": qid,
+                "question": question,
+                "expected": expected_answer,
+                "bot_response": bot_answer,
+                "result": verdict,
+            }
+        )
+
+    print("\n" + "=" * 30)
     print(f"=== Evaluation Summary (No Metadata) ===")
     print(f"Total: {len(test_cases)}")
     print(f"Passed: {passed_count}")
     print(f"Failed: {len(test_cases) - passed_count}")
     if len(test_cases) > 0:
         print(f"Accuracy: {(passed_count / len(test_cases)) * 100:.1f}%")
-    print("="*30)
+    print("=" * 30)
+
 
 if __name__ == "__main__":
     run_llm_evaluation_no_metadata()
