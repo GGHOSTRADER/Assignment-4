@@ -1,8 +1,13 @@
 
-Files run as requested    
-Report file is added as PDF since it has mermaid charts on it.  
+## Report file  
 
+Is added as PDF because it has mermaid charts on it.  
 File name : report_assignment4  
+
+---
+
+## Launching
+Files run as requested 
 
 0) Must install requirements.
 
