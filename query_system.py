@@ -9,6 +9,11 @@ from neo4j import GraphDatabase
 import nltk
 from nltk.corpus import wordnet
 
+# ── NEW: embedding support ──────────────────────────────────────────────────
+import numpy as np
+from sentence_transformers import SentenceTransformer
+# ────────────────────────────────────────────────────────────────────────────
+
 from llm_loader import load_local_llm, get_tokenizer, get_raw_pipeline
 
 
@@ -54,6 +59,50 @@ except LookupError:
     nltk.download("omw-1.4")
 
 
+# ── NEW: load embedding model once at startup ───────────────────────────────
+# ⚠️  Change this to whatever model you used when building the DB embeddings.
+#     It MUST be the same model — mismatched models produce meaningless scores.
+EMBEDDING_MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+_embedding_model: SentenceTransformer | None = None
+
+
+def get_embedding_model() -> SentenceTransformer:
+    """Lazy-load the embedding model (loaded once, reused for every query)."""
+    global _embedding_model
+    if _embedding_model is None:
+        print(f"[embedding] Loading model: {EMBEDDING_MODEL_NAME}")
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+        print("[embedding] Model loaded ✅")
+    return _embedding_model
+
+
+def embed_query(text: str) -> np.ndarray:
+    """Return a unit-normalised embedding vector for text."""
+    model = get_embedding_model()
+    vec = model.encode(text, normalize_embeddings=True)
+    return vec.astype(np.float32)
+
+
+def cosine_similarity(a: np.ndarray | list, b: np.ndarray | list) -> float:
+    """
+    Cosine similarity between two vectors.
+    Embeddings stored in Neo4j come back as plain Python lists —
+    this handles both lists and numpy arrays.
+    Returns a float in [-1, 1]; 1.0 = identical direction.
+    """
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+# ────────────────────────────────────────────────────────────────────────────
+
+
 # ========== 1) Constants ==========
 
 ALLOWED_TYPES = {
@@ -68,138 +117,57 @@ ALLOWED_TYPES = {
 # Words removed before tokenization — functional/structural words with no search value
 STOPWORDS = {
     # articles and conjunctions
-    "the",
-    "a",
-    "an",
-    "and",
-    "or",
-    "of",
-    "to",
-    "from",
-    "than",
-    "more",
-    "less",
-    "be",
-    "is",
-    "are",
-    "was",
-    "were",
-    "will",
-    "shall",
-    "should",
-    "can",
-    "could",
+    "the", "a", "an", "and", "or", "of", "to", "from", "than", "more",
+    "less", "be", "is", "are", "was", "were", "will", "shall", "should",
+    "can", "could",
     # pronouns
-    "my",
-    "me",
-    "i",
-    "we",
-    "us",
-    "you",
-    "he",
-    "she",
-    "they",
-    "them",
-    "their",
-    "his",
-    "her",
-    "its",
+    "my", "me", "i", "we", "us", "you", "he", "she", "they", "them",
+    "their", "his", "her", "its",
     # question words
-    "do",
-    "how",
-    "what",
-    "when",
-    "where",
-    "why",
-    "who",
-    "which",
+    "do", "how", "what", "when", "where", "why", "who", "which",
     # prepositions
-    "if",
-    "for",
-    "in",
-    "on",
-    "at",
-    "by",
-    "with",
-    "about",
-    "this",
-    "that",
-    "it",
-    "not",
-    "no",
-    "yes",
+    "if", "for", "in", "on", "at", "by", "with", "about", "this", "that",
+    "it", "not", "no", "yes",
     # common verbs with no search value
-    "get",
-    "got",
-    "have",
-    "has",
-    "had",
-    "been",
+    "get", "got", "have", "has", "had", "been",
     # quantifiers and determiners
-    "any",
-    "all",
-    "some",
-    "would",
-    "may",
-    "might",
-    "also",
-    "many",
-    "much",
-    "few",
-    "each",
-    "such",
-    "per",
+    "any", "all", "some", "would", "may", "might", "also", "many", "much",
+    "few", "each", "such", "per",
     # time/order words too generic to search
-    "before",
-    "after",
-    "during",
-    "while",
-    "until",
-    "since",
-    "these",
-    "those",
-    "then",
-    "than",
-    "just",
-    "only",
+    "before", "after", "during", "while", "until", "since", "these",
+    "those", "then", "than", "just", "only",
     # single letters and noise
     "x",
 }
 
-# Generic domain words — appear in almost every rule, expand last to save token slots
-LOW_PRIORITY_EXPAND = {
-    "student",
-    "students",
-    "exam",
-    "exams",
-    "course",
-    "courses",
-    "university",
-    "ncu",
-    "school",
-    "semester",
-    "academic",
-    "study",
-    "studies",
-    "rule",
-    "rules",
-    "regulation",
-    "regulations",
-    "article",
-    "department",
-    "program",
-    "degree",
+# Generic domain words — appear in almost every rule.
+LOW_PRIORITY_TOKENS = {
+    "student", "students", "exam", "exams", "course", "courses",
+    "university", "ncu", "school", "semester", "academic", "study",
+    "studies", "rule", "rules", "regulation", "regulations", "article",
+    "department", "program", "degree",
 }
 
-# Max total tokens after expansion (configurable)
-MAX_EXPANDED_TOKENS = 50
+EXPANSIONS_PER_TOKEN = 5
+BASE_TOKEN_WEIGHT    = 4
+LOW_PRIORITY_WEIGHT  = 1
+MIN_BASE_TOKEN_MATCHES = 2
 
-# Weight multiplier for base tokens vs expanded tokens
-BASE_TOKEN_WEIGHT = 3
+# ── NEW: embedding scoring weights ──────────────────────────────────────────
+# How much each embedding field contributes to the combined embedding score.
+# combined_embedding is holistic (action+result together), so it gets most weight.
+EMBED_WEIGHT_COMBINED = 0.50   # combined_embedding vs query
+EMBED_WEIGHT_ACTION   = 0.30   # action_embedding   vs query
+EMBED_WEIGHT_RESULT   = 0.20   # result_embedding   vs query
+
+# How to blend vote score vs embedding score in the final ranking.
+# Increase EMBED_BLEND to trust embeddings more; decrease to trust keyword votes more.
+VOTE_BLEND   = 0.55   # weight given to normalised keyword vote score
+EMBED_BLEND  = 0.45   # weight given to embedding similarity score
+# ────────────────────────────────────────────────────────────────────────────
 
 
 # ========== 2) Helpers ==========
-
 
 def count_words(text: str) -> int:
     if not text or not text.strip():
@@ -208,11 +176,6 @@ def count_words(text: str) -> int:
 
 
 def tokenize_for_retrieval(text: str) -> list[str]:
-    """
-    Tokenize raw text — split into words, lowercase,
-    remove stopwords and very short tokens.
-    No summarization — all meaningful words are kept.
-    """
     tokens = re.findall(r"\b[\w'-]+\b", text.lower())
     return [t for t in tokens if len(t) > 2 and t not in STOPWORDS]
 
@@ -223,7 +186,6 @@ def ensure_llm_loaded() -> None:
 
 
 # ========== 3) Type Classification ==========
-
 
 def build_type_classification_prompt(user_input: str) -> str:
     ensure_llm_loaded()
@@ -311,15 +273,10 @@ def call_llm_once(prompt: str) -> str:
 
 
 def parse_json_text(response_text: str) -> Dict[str, Any]:
-    response_text = response_text.strip()
-    return json.loads(response_text)
+    return json.loads(response_text.strip())
 
 
 def classify_type(user_input: str) -> str:
-    """
-    Ask the LLM to classify the question into one of the allowed types.
-    Returns the type string. Falls back to "other" if classification fails.
-    """
     prompt = build_type_classification_prompt(user_input)
     response_text = call_llm_once(prompt)
 
@@ -330,23 +287,17 @@ def classify_type(user_input: str) -> str:
     try:
         data = parse_json_text(response_text)
         type_value = str(data.get("type", "")).strip().lower()
-
         if type_value not in ALLOWED_TYPES:
-            print(
-                f"[classify_type] Invalid type '{type_value}', falling back to 'other'"
-            )
+            print(f"[classify_type] Invalid type '{type_value}', falling back to 'other'")
             return "other"
-
         print(f"[classify_type] Classified as: '{type_value}'")
         return type_value
-
     except (json.JSONDecodeError, TypeError) as e:
         print(f"[classify_type] Parse error: {e}, falling back to 'other'")
         return "other"
 
 
 # ========== 4) Token Expansion ==========
-
 
 def _get_wordnet_variations(token: str) -> list[str]:
     variations = set()
@@ -360,29 +311,36 @@ def _get_wordnet_variations(token: str) -> list[str]:
 
 
 def _build_synonym_prompt(token: str) -> str:
-    return f"""You are a language expansion assistant for a university regulation search engine.
+    return f"""You are a search-term expansion assistant for a university academic regulation retrieval system.
 
-For the word "{token}" in the context of university academic regulations, generate:
-- synonyms
-- word variations (plural, singular, verb forms, adjective forms, noun forms)
-- related terms used in academic or legal documents
+Your job is to help match a search keyword to the exact words that appear in official university regulations, student handbooks, and academic policy documents.
+
+For the word "{token}", generate exactly {EXPANSIONS_PER_TOKEN} alternative words or short phrases that:
+- Are likely to appear in formal university regulation text (not casual speech)
+- Include common legal/regulatory variants (e.g. plural/singular, verb/noun forms, passive forms)
+- Include synonyms used in academic policy documents (e.g. "dismissed" → "expelled", "barred", "excluded")
+- Are single words only (no multi-word phrases)
 
 Rules:
-- Return a flat JSON array of strings only
+- Return a flat JSON array of exactly {EXPANSIONS_PER_TOKEN} strings
 - All words must be lowercase
 - No duplicates
-- No explanations
-- No markdown
-- Do not include the original word "{token}" in the output
+- No explanations, no markdown, no extra text
+- Do NOT include the original word "{token}"
+- Prioritize words found in legal/regulatory writing over everyday synonyms
 
-Example output format:
-["word1", "word2", "word3"]
+Examples of good expansions:
+  "late"     → ["tardy", "delayed", "overdue", "delinquent", "untimely"]
+  "barred"   → ["excluded", "prohibited", "disqualified", "banned", "denied"]
+  "cheating" → ["misconduct", "dishonesty", "plagiarism", "violation", "fraud"]
+  "absent"   → ["missing", "nonattendance", "truancy", "unexcused", "default"]
+  "penalty"  → ["sanction", "consequence", "deduction", "punishment", "forfeiture"]
 
-Word to expand: "{token}"
-"""
+Now expand: "{token}"
+Output (JSON array only):"""
 
 
-def _parse_llm_expansion(response_text: str) -> list[str]:
+def _parse_llm_expansion(response_text: str, token: str) -> list[str]:
     try:
         clean = re.sub(r"```[a-z]*", "", response_text).replace("```", "").strip()
         match = re.search(r"\[.*?\]", clean, re.DOTALL)
@@ -393,19 +351,21 @@ def _parse_llm_expansion(response_text: str) -> list[str]:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError:
-            print(f"[expansion] JSON parse failed, attempting bare-word recovery")
             parsed = re.findall(r"[\w'-]+", raw)
         return [
             str(w).strip().lower()
             for w in parsed
-            if isinstance(w, str) and len(w.strip()) > 2
+            if isinstance(w, str)
+            and len(w.strip()) > 2
+            and w.strip().lower() != token.lower()
+            and w.strip().lower() not in STOPWORDS
         ]
     except (json.JSONDecodeError, TypeError) as e:
         print(f"[expansion] Parse error: {e} | text: {response_text[:100]}")
         return []
 
 
-def _expand_token_with_llm(token: str) -> list[str]:
+def _expand_token_with_llm(token: str, max_words: int) -> list[str]:
     ensure_llm_loaded()
     prompt = _build_synonym_prompt(token)
     tok = get_tokenizer()
@@ -414,81 +374,62 @@ def _expand_token_with_llm(token: str) -> list[str]:
         messages, tokenize=False, add_generation_prompt=True
     )
     llm = get_raw_pipeline()
-    raw = llm(formatted_prompt, max_new_tokens=300)
-    if isinstance(raw, list) and raw:
-        response_text = raw[0].get("generated_text", "")
-    else:
-        response_text = str(raw)
-    expanded = _parse_llm_expansion(response_text)
-    print(f"  [LLM expand] '{token}' → {expanded}")
-    return expanded
+    raw = llm(formatted_prompt, max_new_tokens=100)
+    response_text = (
+        raw[0].get("generated_text", "") if isinstance(raw, list) and raw else str(raw)
+    )
+    return _parse_llm_expansion(response_text, token)[:max_words]
 
 
-def expand_tokens(
-    tokens: list[str],
-    max_total: int = MAX_EXPANDED_TOKENS,
-) -> list[str]:
-    """
-    Expand tokens using WordNet + LLM synonyms.
-
-    Key behaviors:
-    1. Specific/rare tokens expand first (LOW_PRIORITY_EXPAND tokens expand last)
-       so cap doesn't prevent important tokens like "barred" from expanding.
-    2. Original tokens always preserved in final list.
-    3. Total capped at max_total.
-
-    Example priority order for "minutes late student barred exam":
-        high priority (expand first): "minutes", "late", "barred"
-        low priority (expand last):   "student", "exam"
-    """
-    print(f"\n=== TOKEN EXPANSION (max={max_total}) ===")
+def expand_tokens(tokens: list[str]) -> list[str]:
+    print(f"\n=== TOKEN EXPANSION (per_token_cap={EXPANSIONS_PER_TOKEN}) ===")
     print(f"Original tokens: {tokens}")
 
-    # Sort: specific tokens first, generic (LOW_PRIORITY) tokens last
-    sorted_tokens = sorted(tokens, key=lambda t: t in LOW_PRIORITY_EXPAND)
-    print(f"Expansion order: {sorted_tokens}")
-
     expanded_set = set(tokens)
-    ordered = list(tokens)  # original tokens always preserved first
+    ordered = list(tokens)
 
-    for token in sorted_tokens:
+    for token in tokens:
+        if token in LOW_PRIORITY_TOKENS:
+            print(f"\n[skip expand] '{token}' is a low-priority domain word — not expanding")
+            continue
+
         print(f"\n[expanding] '{token}'")
-        wn_variations = _get_wordnet_variations(token)
-        print(f"  [WordNet] '{token}' → {wn_variations}")
-        llm_synonyms = _expand_token_with_llm(token)
 
-        for word in wn_variations + llm_synonyms:
-            word = word.strip().lower()
-            if word and word not in expanded_set and word not in STOPWORDS:
+        wn_variations = _get_wordnet_variations(token)
+        wn_filtered   = [w for w in wn_variations if w not in expanded_set and w not in STOPWORDS]
+        wn_take        = wn_filtered[:EXPANSIONS_PER_TOKEN]
+        slots_remaining = EXPANSIONS_PER_TOKEN - len(wn_take)
+
+        print(f"  [WordNet] '{token}' → {wn_take} ({len(wn_take)} taken, {slots_remaining} slots left for LLM)")
+        for word in wn_take:
+            expanded_set.add(word)
+            ordered.append(word)
+
+        if slots_remaining > 0:
+            llm_synonyms = _expand_token_with_llm(token, max_words=slots_remaining)
+            llm_filtered = [w for w in llm_synonyms if w not in expanded_set and w not in STOPWORDS]
+            llm_take     = llm_filtered[:slots_remaining]
+            print(f"  [LLM]     '{token}' → {llm_take} ({len(llm_take)} taken)")
+            for word in llm_take:
                 expanded_set.add(word)
                 ordered.append(word)
-
-        if len(ordered) >= max_total:
-            print(f"  [cap] Reached max_total={max_total}, stopping early.")
-            break
-
-    # Always preserve originals — fill remaining slots with expansions
-    original_set = set(tokens)
-    expansions = [t for t in ordered if t not in original_set]
-    slots = max(0, max_total - len(tokens))
-    final = tokens + expansions[:slots]
+        else:
+            print(f"  [LLM]     skipped — WordNet already filled {EXPANSIONS_PER_TOKEN} slots")
 
     print(f"\n=== EXPANSION RESULT ===")
     print(f"Original count : {len(tokens)}")
-    print(f"Expanded count : {len(final)}")
-    print(f"Original tokens guaranteed: {tokens}")
-    print(f"Expanded tokens: {final}")
+    print(f"Total count    : {len(ordered)}")
+    print(f"Base tokens    : {tokens}")
+    print(f"All tokens     : {ordered}")
 
-    return final
+    return ordered
 
 
 # ========== 5) Params Builder ==========
 
-
 def build_voting_params(
     user_q: str,
     question_type: str,
-    max_total: int = MAX_EXPANDED_TOKENS,
 ) -> dict[str, Any]:
     base_tokens = tokenize_for_retrieval(user_q)
 
@@ -496,44 +437,52 @@ def build_voting_params(
     print("Raw question :", user_q)
     print("Base tokens  :", base_tokens)
 
-    expanded_tokens = expand_tokens(base_tokens, max_total=max_total)
+    expanded_tokens = expand_tokens(base_tokens)
+
+    # ── NEW: embed the raw question once here ───────────────────────────────
+    print("\n[embedding] Embedding query...")
+    query_embedding = embed_query(user_q)
+    print(f"[embedding] Query vector shape: {query_embedding.shape}")
+    # ────────────────────────────────────────────────────────────────────────
 
     return {
         "type": question_type,
         "base_tokens": base_tokens,
         "all_tokens": expanded_tokens,
+        "query_embedding": query_embedding,   # ← NEW
     }
 
 
 # ========== 6) Cypher Queries ==========
 
-
 def build_voting_cypher() -> str:
     """
-    Returns Rule nodes where at least one base token matches
-    AND at least one expanded token matches.
-    base_tokens must match to ensure relevance.
-    all_tokens broadens the net for scoring.
+    Same as before, but now also returns the three embedding fields so
+    Python-side cosine similarity can be computed without a second round-trip.
+
+    Note: embedding properties are returned as plain Python lists by the
+    Neo4j driver — numpy handles those fine in cosine_similarity().
     """
     return """
 MATCH (z:Rule)
-WHERE (
-    ANY(word IN $base_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
-    OR
-    ANY(word IN $base_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
-  )
-  AND (
-    ANY(word IN $all_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
-    OR
-    ANY(word IN $all_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
-  )
+WITH z,
+  size([
+    word IN $base_tokens
+    WHERE toLower(coalesce(z.action, '')) =~ ('.*\\\\b' + word + '\\\\b.*')
+       OR toLower(coalesce(z.result, '')) =~ ('.*\\\\b' + word + '\\\\b.*')
+  ]) AS base_hit_count
+WHERE base_hit_count >= $min_base_matches
 RETURN
-    z.rule_id  AS rule_id,
-    z.type     AS type,
-    z.action   AS action,
-    z.result   AS result,
-    z.art_ref  AS art_ref,
-    z.reg_name AS reg_name
+    z.rule_id            AS rule_id,
+    z.type               AS type,
+    z.action             AS action,
+    z.result             AS result,
+    z.art_ref            AS art_ref,
+    z.reg_name           AS reg_name,
+    base_hit_count,
+    z.action_embedding   AS action_embedding,
+    z.result_embedding   AS result_embedding,
+    z.combined_embedding AS combined_embedding
 """
 
 
@@ -549,54 +498,80 @@ RETURN
 
 # ========== 7) Vote Scoring ==========
 
-
 def _compute_vote_score(
     row: dict[str, Any],
     base_tokens: list[str],
     all_tokens: list[str],
 ) -> int:
-    """
-    Count weighted token matches in rule's action + result fields.
-
-    Base tokens (original question words) are worth BASE_TOKEN_WEIGHT (3x).
-    Expanded tokens (synonyms/variations) are worth 1x.
-
-    A token can score in both action and result fields.
-
-    Example:
-        base_tokens = ["minutes", "late", "barred", "exam"]
-        Rule 4 action = "Students arriving more than 20 minutes..."
-            "minutes" → base → weight=3 ✅
-            "exam"    → base → weight=3 ✅
-            total = 6  (+ expanded token matches on top)
-
-        Article 19 rule = "late submission of grades"
-            "late"    → base → weight=3 ✅
-            total = 3
-    """
     row_action = str(row.get("action", "") or "").lower()
     row_result = str(row.get("result", "") or "").lower()
-
-    base_set = set(base_tokens)
-    votes = 0
+    base_set   = set(base_tokens)
+    votes      = 0
 
     for token in all_tokens:
-        weight = BASE_TOKEN_WEIGHT if token in base_set else 1
-        if token in row_action:
+        pattern = r"\b" + re.escape(token) + r"\b"
+        if token in base_set:
+            weight = BASE_TOKEN_WEIGHT
+        elif token in LOW_PRIORITY_TOKENS:
+            weight = LOW_PRIORITY_WEIGHT
+        else:
+            weight = 1
+
+        if re.search(pattern, row_action):
             votes += weight
-        if token in row_result:
+        if re.search(pattern, row_result):
             votes += weight
 
     return votes
+
+
+# ── NEW: embedding score for a single rule row ──────────────────────────────
+def _compute_embedding_score(
+    row: dict[str, Any],
+    query_embedding: np.ndarray,
+) -> float:
+    """
+    Weighted cosine similarity across all three embedding fields.
+
+    Fields that are missing or empty (None / []) silently contribute 0
+    so that partially-populated rules are penalised but not crashed.
+
+    Returns a float in [0, 1] (embeddings are unit-normalised, so cosine
+    similarity is in [-1, 1]; negative values are clamped to 0 since a
+    negative similarity is practically meaningless for retrieval).
+    """
+    def _safe_sim(field_key: str, weight: float) -> float:
+        vec = row.get(field_key)
+        if not vec:          # None or empty list
+            return 0.0
+        sim = cosine_similarity(query_embedding, vec)
+        return max(0.0, sim) * weight   # clamp negatives to 0
+
+    score = (
+        _safe_sim("action_embedding",   EMBED_WEIGHT_ACTION)
+        + _safe_sim("result_embedding",   EMBED_WEIGHT_RESULT)
+        + _safe_sim("combined_embedding", EMBED_WEIGHT_COMBINED)
+    )
+    return score   # range: [0, 1] when weights sum to 1
+# ────────────────────────────────────────────────────────────────────────────
 
 
 def _rank_by_votes(
     rows: list[dict[str, Any]],
     base_tokens: list[str],
     all_tokens: list[str],
+    query_embedding: np.ndarray,   # ← NEW param
 ) -> list[dict[str, Any]]:
     """
-    Score each rule by weighted vote count, dedupe by rule_id, sort descending.
+    Score each rule by a BLENDED score:
+        final_score = VOTE_BLEND  * normalised_vote_score
+                    + EMBED_BLEND * embedding_score
+
+    Vote scores are an unbounded integer — they are normalised to [0, 1]
+    by dividing by the maximum vote score in the candidate set before blending.
+    Embedding scores are already in [0, 1].
+
+    Deduplication by rule_id keeps the highest-scoring record per rule.
     """
     merged: dict[str, dict[str, Any]] = {}
 
@@ -604,23 +579,47 @@ def _rank_by_votes(
         rule_id = str(row.get("rule_id", "") or "").strip()
         if not rule_id:
             continue
-        row["vote_score"] = _compute_vote_score(row, base_tokens, all_tokens)
+
+        # ── keyword vote score (raw integer) ──────────────────────────────
+        vote_score = _compute_vote_score(row, base_tokens, all_tokens)
+        row["vote_score"] = vote_score
+
+        # ── NEW: embedding similarity score ───────────────────────────────
+        embedding_score = _compute_embedding_score(row, query_embedding)
+        row["embedding_score"] = embedding_score
+        # ──────────────────────────────────────────────────────────────────
+
         if rule_id not in merged:
             merged[rule_id] = row
-        elif row["vote_score"] > merged[rule_id]["vote_score"]:
+        elif vote_score > merged[rule_id]["vote_score"]:
             merged[rule_id] = row
 
+    # ── NEW: normalise vote scores to [0, 1] before blending ─────────────
+    all_rows = list(merged.values())
+    max_vote  = max((r["vote_score"] for r in all_rows), default=1) or 1
+    for row in all_rows:
+        norm_vote           = row["vote_score"] / max_vote
+        row["norm_vote"]    = norm_vote
+        row["final_score"]  = (
+            VOTE_BLEND  * norm_vote
+            + EMBED_BLEND * row["embedding_score"]
+        )
+    # ─────────────────────────────────────────────────────────────────────
+
     ranked = sorted(
-        merged.values(),
-        key=lambda x: x.get("vote_score", 0),
+        all_rows,
+        key=lambda x: x.get("final_score", 0.0),
         reverse=True,
     )
 
-    print("\n=== RULE VOTE RANKING ===")
+    print("\n=== RULE RANKING (vote + embedding) ===")
     for idx, row in enumerate(ranked, start=1):
         print(
             f"[{idx}] rule_id={row.get('rule_id')} | "
-            f"votes={row.get('vote_score')} | "
+            f"final={row.get('final_score', 0.0):.4f} | "
+            f"norm_vote={row.get('norm_vote', 0.0):.3f} | "
+            f"embed={row.get('embedding_score', 0.0):.3f} | "
+            f"base_hits={row.get('base_hit_count')} | "
             f"art_ref={row.get('art_ref')} | "
             f"action={str(row.get('action', ''))[:60]}"
         )
@@ -630,20 +629,13 @@ def _rank_by_votes(
 
 # ========== 8) Article Aggregation ==========
 
-
 def _aggregate_votes_by_article(
     ranked_rules: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """
-    Aggregate rule vote scores up to the article level.
-    Normalizes by rule count so articles with many weak rules
-    don't outrank articles with few strong rules.
-
-    normalized_score = total_votes / rule_count
-
-    Example:
-        Rule 4:    total=18  count=2  normalized=9.0  ← wins
-        Article 3: total=36  count=17 normalized=2.1  ← drops
+    Aggregate the blended final_score up to the article level.
+    Uses the same normalised-by-count logic as before, but now on final_score
+    instead of raw vote_score — so embedding signal is already baked in.
     """
     article_scores: dict[str, dict[str, Any]] = {}
 
@@ -652,21 +644,22 @@ def _aggregate_votes_by_article(
         if not art_ref:
             continue
 
-        vote_score = int(rule.get("vote_score", 0) or 0)
+        # ── NEW: use final_score (blended) instead of raw vote_score ──────
+        final_score = float(rule.get("final_score", 0.0) or 0.0)
+        # ──────────────────────────────────────────────────────────────────
 
         if art_ref not in article_scores:
             article_scores[art_ref] = {
                 "art_ref": art_ref,
-                "total_votes": 0,
+                "total_score": 0.0,
                 "rule_count": 0,
             }
 
-        article_scores[art_ref]["total_votes"] += vote_score
-        article_scores[art_ref]["rule_count"] += 1
+        article_scores[art_ref]["total_score"] += final_score
+        article_scores[art_ref]["rule_count"]  += 1
 
-    # Normalize by rule count — penalizes articles that win only by volume
     for art in article_scores.values():
-        art["normalized_score"] = art["total_votes"] / art["rule_count"]
+        art["normalized_score"] = art["total_score"] / art["rule_count"]
 
     ranked_articles = sorted(
         article_scores.values(),
@@ -674,13 +667,13 @@ def _aggregate_votes_by_article(
         reverse=True,
     )
 
-    print("\n=== ARTICLE VOTE AGGREGATION ===")
+    print("\n=== ARTICLE AGGREGATION (blended scores) ===")
     for idx, article in enumerate(ranked_articles, start=1):
         print(
             f"[{idx}] art_ref={article['art_ref']} | "
-            f"total_votes={article['total_votes']} | "
+            f"total_score={article['total_score']:.4f} | "
             f"rules_matched={article['rule_count']} | "
-            f"normalized={article['normalized_score']:.2f}"
+            f"normalized={article['normalized_score']:.4f}"
         )
 
     return ranked_articles
@@ -688,45 +681,31 @@ def _aggregate_votes_by_article(
 
 # ========== 9) Article Content Fetcher ==========
 
-
 def fetch_top_article_contents(
     ranked_articles: list[dict[str, Any]],
-    top_n: int = 2,
+    top_n: int = 4 ,
 ) -> list[dict[str, Any]]:
-    """
-    Take the top_n articles by normalized score,
-    fetch their full content from Neo4j.
-
-    Returns list of dicts: [{art_ref, content}, ...]
-    """
     if driver is None:
         return []
 
     art_refs = [a["art_ref"] for a in ranked_articles[:top_n] if a.get("art_ref")]
-
     if not art_refs:
         print("\n[article fetch] No art_refs to fetch.")
         return []
 
-    print(f"\n=== FETCHING ARTICLE CONTENT ===")
-    print(f"Fetching top {top_n} articles: {art_refs}")
+    
 
     query = build_article_content_cypher()
-
     with driver.session() as session:
         records = session.run(query, {"art_refs": art_refs})
         articles = [dict(record) for record in records]
 
-    print(f"Articles fetched: {len(articles)}")
-    for a in articles:
-        content_preview = str(a.get("content", "") or "")[:80]
-        print(f"  art_ref={a.get('art_ref')} | preview: {content_preview}...")
-
+    
+    
     return articles
 
 
 # ========== 10) Retrieval ==========
-
 
 def get_relevant_articles(
     params: dict[str, Any],
@@ -734,121 +713,117 @@ def get_relevant_articles(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     """
     Full retrieval pipeline:
-    1. Run voting Cypher query against Rule nodes
-    2. Rank rules by weighted vote score (base tokens = 3x weight)
-    3. Aggregate rule votes up to article level
-    4. Normalize article scores by rule count
+    1. Run voting Cypher — fetches rule fields + all three embedding vectors
+    2. Score each rule:
+         a. keyword vote score  (whole-word regex, weighted)
+         b. embedding score     (weighted cosine sim across action/result/combined)
+         c. final_score         = VOTE_BLEND * norm_vote + EMBED_BLEND * embed_sim
+    3. Deduplicate by rule_id, sort by final_score
+    4. Aggregate final_score up to article level, normalise by rule count
     5. Fetch full content for top 2 articles
-
-    Returns:
-        ranked_rules     — top_k ranked Rule rows
-        ranked_articles  — articles sorted by normalized score
-        article_contents — full content of top 2 Article nodes
     """
     if driver is None:
         return [], [], []
 
     cypher_fetch_count = 0
-    query = build_voting_cypher()
-    base_tokens = params["base_tokens"]
-    all_tokens = params["all_tokens"]
+    query        = build_voting_cypher()
+    base_tokens  = params["base_tokens"]
+    all_tokens   = params["all_tokens"]
+    query_embedding = params["query_embedding"]   # ← NEW
 
     print("\n=== RETRIEVAL PARAMS ===")
-    print(f"type (classifier): {params['type']}")
-    print(f"base_tokens: {base_tokens}")
-    print(f"token count: {len(all_tokens)}")
-    print(f"all_tokens : {all_tokens}")
+    print(f"type (classifier)   : {params['type']}")
+    print(f"base_tokens         : {base_tokens}")
+    print(f"all_tokens count    : {len(all_tokens)}")
+    print(f"all_tokens          : {all_tokens}")
+    print(f"min_base_matches    : {MIN_BASE_TOKEN_MATCHES}")
+    print(f"query_embedding dim : {query_embedding.shape[0]}")   # ← NEW
+    print(f"vote/embed blend    : {VOTE_BLEND}/{EMBED_BLEND}")    # ← NEW
 
     with driver.session() as session:
-        records = session.run(query, params)
+        records = session.run(
+            query,
+            {
+                "base_tokens": base_tokens,
+                "all_tokens": all_tokens,
+                "min_base_matches": MIN_BASE_TOKEN_MATCHES,
+            },
+        )
         rows = [dict(record) for record in records]
     cypher_fetch_count += 1
-    print(f"\nCypher fetch #1 (Rule query) → {len(rows)} raw hits")
+    print(f"\nCypher fetch #1 → {len(rows)} raw hits (base_hit_count >= {MIN_BASE_TOKEN_MATCHES})")
 
-    # Rank rules by weighted vote score
-    ranked_rules = _rank_by_votes(rows, base_tokens, all_tokens)
+    # Rank rules by blended score
+    ranked_rules = _rank_by_votes(rows, base_tokens, all_tokens, query_embedding)   # ← NEW arg
 
-    # Aggregate and normalize votes at article level
+    # Aggregate blended scores up to article level
     ranked_articles = _aggregate_votes_by_article(ranked_rules)
 
     # Fetch full content for top 2 articles
-    article_contents = fetch_top_article_contents(ranked_articles, top_n=2)
+    article_contents = fetch_top_article_contents(ranked_articles, top_n=4)
     if article_contents:
         cypher_fetch_count += 1
 
     print(f"\n=== CYPHER FETCH SUMMARY ===")
     print(f"Total Cypher fetches this query: {cypher_fetch_count}")
-    print(f"  #1 — Rule nodes query")
+    print(f"  #1 — Rule nodes query (whole-word regex + embeddings returned)")
     if cypher_fetch_count >= 2:
         print(f"  #2 — Article content fetch (top 2 art_refs)")
 
-    print(f"\nReturning top {top_k} rules, top 2 articles")
-
+    
     return ranked_rules[:top_k], ranked_articles, article_contents
 
 
 # ========== 11) Generation ==========
 
-
-def _format_articles_for_generation(
-    article_contents: list[dict[str, Any]],
-) -> str:
+def _format_articles_for_generation(article_contents: list[dict[str, Any]]) -> str:
     if not article_contents:
         return "No article content retrieved."
-
     lines = []
     for i, article in enumerate(article_contents, start=1):
         lines.append(
             f"Article {i} (art_ref: {article.get('art_ref', '')}):\n"
             f"{str(article.get('content', '') or '').strip()}\n"
         )
-
     return "\n---\n".join(lines)
 
 
 def generate_text(messages: list[dict[str, str]], max_new_tokens: int = 220) -> str:
-    tok = get_tokenizer()
+    tok  = get_tokenizer()
     pipe = get_raw_pipeline()
 
     if tok is None or pipe is None:
         load_local_llm()
-        tok = get_tokenizer()
+        tok  = get_tokenizer()
         pipe = get_raw_pipeline()
 
-    prompt = tok.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    prompt = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     return pipe(prompt, max_new_tokens=max_new_tokens)[0]["generated_text"].strip()
 
 
-def generate_answer(
-    question: str,
-    article_contents: list[dict[str, Any]],
-) -> str:
-    """
-    Generate final answer using full Article content from top 2 ranked articles.
-    """
+def generate_answer(question: str, article_contents: list[dict[str, Any]]) -> str:
     articles_context = _format_articles_for_generation(article_contents)
+
+    # Build the list of valid art_refs to explicitly constrain citation
+    valid_refs = [a.get("art_ref", "") for a in article_contents]
+    valid_refs_str = ", ".join(valid_refs)
 
     messages = [
         {
             "role": "system",
-            "content": """
+            "content": f"""
 You are a careful regulation QA assistant.
 
-- Answer the user's question using ONLY the retrieved article content provided.
-- Do not invent facts.
-- If the article gives a partial answer, explain the limitation.
-- Do NOT default to "I don't know" if some relevant content exists.
-- Only say "I don't know" if no relevant content exists at all.
+STRICT RULES:
+- Use ONLY the article content provided below. Do not use any outside knowledge.
+- You may ONLY cite these sources: {valid_refs_str}
+- If you cannot find the answer in the provided articles, say: "The provided articles do not contain a clear answer to this question."
+- NEVER invent facts, numbers, or article references not present in the content below.
+- A wrong answer with a fake citation is worse than admitting the answer is not found.
 
 Instructions:
-- Prefer the most directly relevant article.
-- If both articles are relevant, synthesize them briefly.
-- Cite the supporting source at the end in this format:
-  [Source: <art_ref>]
-- If more than one source is used, include multiple citations.
-- Be concise and direct.
+- Cite the supporting source at the end: [Source: <art_ref>]
+- Be concise and direct. Short answer, do not over explain.
 """.strip(),
         },
         {
@@ -860,60 +835,47 @@ Question:
 Retrieved article content:
 {articles_context}
 
-Write the final answer.
+Write the final answer. Only use content from the articles above.
 """.strip(),
         },
     ]
 
     return generate_text(messages, max_new_tokens=220).strip()
 
-
 # ========== 12) Main Pipeline ==========
-
 
 def answer_question(user_q: str) -> str:
     """
     Full pipeline:
-    1. Classify type only (LLM — one word output)
-    2. Tokenize raw question — stopwords removed (expanded set)
-    3. Expand tokens — specific tokens first, generic last
-    4. Check DB connectivity — fail fast if unavailable
-    5. Voting Cypher query against Rule nodes
-    6. Rank rules by weighted vote score (base tokens = 3x)
-    7. Aggregate rule votes up to article level, normalize by rule count
-    8. Fetch top 2 articles by normalized score
-    9. Generate answer from raw question + full article content
+    1. Classify type (LLM)
+    2. Tokenize + expand tokens (WordNet + LLM)
+    3. Embed the raw query                             ← NEW
+    4. Voting Cypher — returns rules + embedding vecs  ← UPDATED
+    5. Score: keyword votes + cosine similarity        ← NEW
+    6. Blend into final_score, rank rules              ← NEW
+    7. Aggregate final_score to article level
+    8. Fetch top 2 article contents
+    9. Generate answer
     """
-
-    # Step 1 — type only
     question_type = classify_type(user_q)
 
-    # Step 2+3 — tokenize raw question + expand (specific tokens first)
     params = build_voting_params(
         user_q=user_q,
         question_type=question_type,
-        max_total=MAX_EXPANDED_TOKENS,
     )
 
-    # Step 4 — fail fast if DB unavailable
     if driver is None:
         return "Unable to answer: database is not connected."
 
-    # Step 5+6+7+8 — retrieve, rank, aggregate, fetch
     ranked_rules, ranked_articles, article_contents = get_relevant_articles(
         params=params,
         top_k=10,
     )
 
-    # Step 9 — no results found
     if not article_contents:
         return "No relevant articles were found for your question."
 
-    # Step 10 — generate from raw question + full article content
-    return generate_answer(
-        question=user_q,
-        article_contents=article_contents,
-    )
+    return generate_answer(question=user_q, article_contents=article_contents)
 
 
 # ========== 13) Entry Point ==========
@@ -923,29 +885,24 @@ if __name__ == "__main__":
         print("\n❌ Neo4j driver is NOT connected. Exiting.\n")
     else:
         load_local_llm()
+        get_embedding_model()   # ← NEW: warm up embedding model at startup
 
         print("=" * 50)
         print("🎓 NCU Regulation Assistant")
         print("=" * 50)
-        print(
-            "💡 Try: 'How many minutes late can a student be before they are barred from the exam?'"
-        )
+        print("💡 Try: 'How many minutes late can a student be before they are barred from the exam?'")
         print("👉 Type 'exit' to quit.\n")
 
         while True:
             try:
                 user_q = input("\nUser: ").strip()
-
                 if not user_q:
                     continue
-
                 if user_q.lower() in {"exit", "quit"}:
                     print("👋 Bye!")
                     break
-
                 answer = answer_question(user_q)
                 print(f"\nBot: {answer}")
-
             except KeyboardInterrupt:
                 print("\n👋 Bye!")
                 break

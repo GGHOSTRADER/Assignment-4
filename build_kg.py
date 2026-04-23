@@ -21,6 +21,10 @@ import re
 from llm_loader import load_local_llm, get_tokenizer, get_raw_pipeline
 
 
+# At the top, add:
+from sentence_transformers import SentenceTransformer
+
+
 # ========== 0) Initialization ==========
 load_dotenv()
 
@@ -31,6 +35,14 @@ AUTH = (
 )
 
 BATCH_SIZE = 3
+
+_embedder: SentenceTransformer | None = None
+
+def get_embedder() -> SentenceTransformer:
+    global _embedder
+    if _embedder is None:
+        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    return _embedder
 
 
 def chunked(seq: List[Tuple], size: int) -> Iterable[List[Tuple]]:
@@ -380,20 +392,107 @@ def write_rules_batch(driver, rules_to_write: List[Dict]) -> None:
                 reg_name=item["reg_name"],
             )
 
+def embed_rules(rules: List[Dict]) -> List[Dict]:
+    """
+    Adds action_embedding, result_embedding, combined_embedding
+    to each rule dict in-place. result_embedding is None when result is empty.
+    """
+    embedder = get_embedder()
+
+    action_texts    = [r["action"] for r in rules]
+    result_texts    = [r["result"] for r in rules]
+    combined_texts  = [
+        r["action"] + (" " + r["result"] if r["result"] else "")
+        for r in rules
+    ]
+
+    action_vecs   = embedder.encode(action_texts,   convert_to_numpy=True)
+    combined_vecs = embedder.encode(combined_texts, convert_to_numpy=True)
+
+    # Only embed non-empty results in a single batch
+    non_empty_idx  = [i for i, r in enumerate(rules) if r["result"]]
+    result_vecs    = [None] * len(rules)
+    if non_empty_idx:
+        batch        = [result_texts[i] for i in non_empty_idx]
+        batch_vecs   = embedder.encode(batch, convert_to_numpy=True)
+        for idx, vec in zip(non_empty_idx, batch_vecs):
+            result_vecs[idx] = vec
+
+    for i, rule in enumerate(rules):
+        rule["action_embedding"]   = action_vecs[i].tolist()
+        rule["result_embedding"]   = result_vecs[i].tolist() if result_vecs[i] is not None else None
+        rule["combined_embedding"] = combined_vecs[i].tolist()
+
+    return rules
+
+
+def write_rules_batch(driver, rules_to_write: List[Dict]) -> None:
+    """
+    Short-lived write session for one processed batch.
+    Includes embedding vectors on Rule nodes.
+    """
+    # Embed before opening the DB session
+    rules_to_write = embed_rules(rules_to_write)
+
+    with driver.session() as session:
+        for item in rules_to_write:
+            session.run(
+                """
+                MATCH (a:Article {number: $art_ref, reg_name: $reg_name})
+                MERGE (z:Rule {rule_id: $rule_id})
+                SET z.type                = $type,
+                    z.action              = $action,
+                    z.result              = $result,
+                    z.art_ref             = $art_ref,
+                    z.reg_name            = $reg_name,
+                    z.action_embedding    = $action_embedding,
+                    z.result_embedding    = $result_embedding,
+                    z.combined_embedding  = $combined_embedding
+                MERGE (a)-[:CONTAINS_RULE]->(z)
+                """,
+                rule_id            = item["rule_id"],
+                type               = item["type"],
+                action             = item["action"],
+                result             = item["result"],
+                art_ref            = item["art_ref"],
+                reg_name           = item["reg_name"],
+                action_embedding   = item["action_embedding"],
+                result_embedding   = item["result_embedding"],
+                combined_embedding = item["combined_embedding"],
+            )
+
 
 def finalize_graph(driver) -> None:
     """
     Short-lived final session:
-    - create rule fulltext index
+    - fulltext index on action + result only (type dropped)
+    - vector indexes on the three embedding properties (Neo4j 5.x)
     - coverage audit
     """
     with driver.session() as session:
+        # Fulltext: action + result only, type removed
         session.run(
             """
             CREATE FULLTEXT INDEX rule_idx IF NOT EXISTS
-            FOR (z:Rule) ON EACH [z.action, z.result, z.type]
+            FOR (z:Rule) ON EACH [z.action, z.result]
             """
         )
+
+        # Vector indexes — requires Neo4j 5.x Enterprise or AuraDB
+        # all-MiniLM-L6-v2 produces 384-dim vectors
+        for prop in ("action_embedding", "result_embedding", "combined_embedding"):
+            session.run(
+                f"""
+                CREATE VECTOR INDEX rule_{prop}_idx IF NOT EXISTS
+                FOR (z:Rule) ON z.{prop}
+                OPTIONS {{
+                    indexConfig: {{
+                        `vector.dimensions`: 384,
+                        `vector.similarity_function`: 'cosine'
+                    }}
+                }}
+                """
+            )
 
         coverage = session.run(
             """
@@ -406,16 +505,14 @@ def finalize_graph(driver) -> None:
             """
         ).single()
 
-        total_articles = int((coverage or {}).get("total_articles", 0) or 0)
-        covered_articles = int((coverage or {}).get("covered_articles", 0) or 0)
+        total_articles    = int((coverage or {}).get("total_articles",    0) or 0)
+        covered_articles  = int((coverage or {}).get("covered_articles",  0) or 0)
         uncovered_articles = int((coverage or {}).get("uncovered_articles", 0) or 0)
 
         print(
             f"[Coverage] covered={covered_articles}/{total_articles}, "
             f"uncovered={uncovered_articles}"
         )
-
-
 def build_graph() -> None:
     """Build KG from SQLite into Neo4j using the fixed assignment schema."""
     VALID_TYPES = {
