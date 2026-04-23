@@ -280,7 +280,6 @@ def classify_type(user_input: str) -> str:
     prompt = build_type_classification_prompt(user_input)
     response_text = call_llm_once(prompt)
 
-    -------------------------\n")
 
     try:
         data = parse_json_text(response_text)
