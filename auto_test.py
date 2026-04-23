@@ -1,3 +1,4 @@
+# auto_test.py
 import os
 import sys
 from pathlib import Path
@@ -16,27 +17,11 @@ TEST_DATA_PATH = ROOT_DIR / "test_data.json"
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# $$$$ NEW CODE $$$$
+# answer_question runs the full pipeline internally:
+# classify_type → build_voting_params → get_relevant_articles → generate_answer
 from query_system import answer_question, generate_text
 
-# $$$$ NEW CODE $$$$
-
 load_dotenv()
-
-# $$$$ NEW CODE $$$$
-PROFILE = (
-    "Classify the user request into exactly one legal-style category "
-    "and summarize the action and result under the required schema."
-)
-
-SCHEMA_DESCRIPTION = """
-{
-  "type": "choose exactly one of: obligation, prohibition, permission, penalty, procedure, other",
-  "action": "6 or less words",
-  "result": "6 or less words, if not possible use empty string"
-}
-""".strip()
-# $$$$ NEW CODE $$$$
 
 
 def preflight_checks() -> bool:
@@ -73,22 +58,19 @@ def preflight_checks() -> bool:
     return True
 
 
-def ask_bot_no_metadata(question):
-    """Run the full QA pipeline exposed by query_system.py."""
+def ask_bot(question: str) -> str:
+    """
+    Run the full QA pipeline for one question.
+    answer_question() handles everything:
+        classify_type → build_voting_params → get_relevant_articles → generate_answer
+    """
     try:
-        # $$$$ NEW CODE $$$$
-        final_answer = answer_question(
-            user_q=question,
-            profile=PROFILE,
-            schema_description=SCHEMA_DESCRIPTION,
-        )
-        return final_answer
-        # $$$$ NEW CODE $$$$
+        return answer_question(user_q=question)
     except Exception as e:
         return f"Error: {str(e)}"
 
 
-def evaluate_with_llm(question, expected, actual):
+def evaluate_with_llm(question: str, expected: str, actual: str) -> str:
     messages = [
         {
             "role": "system",
@@ -115,10 +97,8 @@ def evaluate_with_llm(question, expected, actual):
 
     try:
         text = generate_text(messages).strip()
-
-        # $$$$ NEW CODE $$$$
-        # More robust judge extraction in case the local model echoes the prompt
         upper_text = text.upper()
+
         if "FAIL" in upper_text and "PASS" not in upper_text:
             return "FAIL"
         if "PASS" in upper_text and "FAIL" not in upper_text:
@@ -134,12 +114,12 @@ def evaluate_with_llm(question, expected, actual):
                 return "FAIL"
 
         return "FAIL"
-        # $$$$ NEW CODE $$$$
+
     except Exception as e:
         return f"FAIL (Judge Error: {str(e)})"
 
 
-def run_llm_evaluation_no_metadata():
+def run_llm_evaluation():
     if not preflight_checks():
         return
 
@@ -150,14 +130,12 @@ def run_llm_evaluation_no_metadata():
         print("[X] Error: test_data.json not found!")
         return
 
-    print(
-        f"[*] Starting LLM-based Evaluation (No Metadata) for {len(test_cases)} Questions...\n"
-    )
+    print(f"[*] Starting Evaluation for {len(test_cases)} Questions...\n")
 
     passed_count = 0
     results_log = []
 
-    for i, case in enumerate(test_cases):
+    for case in test_cases:
         qid = case["id"]
         question = case["question"]
         expected_answer = case["answer"]
@@ -165,8 +143,7 @@ def run_llm_evaluation_no_metadata():
         print(f"Testing Q{qid}: {question}")
 
         start_time = time.time()
-        bot_answer = ask_bot_no_metadata(question)
-
+        bot_answer = ask_bot(question)
         verdict = evaluate_with_llm(question, expected_answer, bot_answer)
         duration = time.time() - start_time
 
@@ -189,14 +166,14 @@ def run_llm_evaluation_no_metadata():
         )
 
     print("\n" + "=" * 30)
-    print("=== Evaluation Summary (No Metadata) ===")
-    print(f"Total: {len(test_cases)}")
-    print(f"Passed: {passed_count}")
-    print(f"Failed: {len(test_cases) - passed_count}")
+    print("=== Evaluation Summary ===")
+    print(f"Total  : {len(test_cases)}")
+    print(f"Passed : {passed_count}")
+    print(f"Failed : {len(test_cases) - passed_count}")
     if len(test_cases) > 0:
         print(f"Accuracy: {(passed_count / len(test_cases)) * 100:.1f}%")
     print("=" * 30)
 
 
 if __name__ == "__main__":
-    run_llm_evaluation_no_metadata()
+    run_llm_evaluation()

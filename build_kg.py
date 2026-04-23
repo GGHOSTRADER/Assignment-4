@@ -11,7 +11,7 @@ Keep this contract unchanged:
 
 import os
 import sqlite3
-from typing import List, Dict, Tuple, Iterable
+from typing import List, Dict, Tuple, Iterable, Optional
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 import hashlib
@@ -39,68 +39,126 @@ def chunked(seq: List[Tuple], size: int) -> Iterable[List[Tuple]]:
         yield seq[i : i + size]
 
 
+# ========== 1) Reg-name → type mapping ==========
+
+# Keyword fragments matched (via regex) against the lowercased regulation name.
+# Order matters: more specific entries first.
+_REG_NAME_TYPE_RULES: List[Tuple[List[str], str]] = [
+    # These map regulation names to the dominant rule flavour found in that regulation.
+    # The LLM still classifies each sentence — this is used as the default/fallback type
+    # when the LLM fails, and as a hint in the prompt.
+    (["exam", "examination", "test rules", "invigilation"], "obligation"),
+    (["grade", "grading", "gpa", "academic performance", "score"], "procedure"),
+    (
+        ["credit recognition", "credit waiver", "credit transfer", "credit exemption"],
+        "procedure",
+    ),
+    (
+        [
+            "course selection",
+            "course enrollment",
+            "add.*drop",
+            "course registration",
+            "curriculum",
+        ],
+        "procedure",
+    ),
+    (["student id", "identification card", "id card", "student card"], "procedure"),
+    # broad/master regulations — intentionally last
+    (
+        [
+            "academic regulations",
+            "student regulations",
+            "study regulations",
+            "general regulations",
+            "academic affairs",
+            "undergraduate",
+            "postgraduate",
+            "enrollment regulations",
+            "registration regulations",
+        ],
+        "obligation",
+    ),
+]
+
+
+def reg_name_to_type(reg_name: str) -> Optional[str]:
+    """
+    Derive the rule type deterministically from the regulation name.
+    Returns None if no pattern matches.
+    """
+    low = reg_name.lower()
+    for keywords, rule_type in _REG_NAME_TYPE_RULES:
+        for kw in keywords:
+            if re.search(kw, low):
+                return rule_type
+    return None
+
+
+def resolve_type(reg_name: str) -> str:
+    """Always returns a valid type; falls back to 'general' if unmatched."""
+    return reg_name_to_type(reg_name) or "general"
+
+
+# ========== 2) Prompt — LLM only fills action + result ==========
+
+
 def build_prompt(article_number: str, reg_name: str, content: str) -> str:
+    """
+    Constructs a structured prompt for Qwen-2.5-3B to extract verbatim rules
+    from regulation text into JSON format.
+    """
     tokenizer = get_tokenizer()
 
+    # System message defining the extraction logic and strict verbatim requirements
     messages = [
         {
             "role": "system",
-            "content": f"""
-Extract rules from the regulation text below.
-
-Field definitions:
-- type: choose exactly one of:
-  eligibility, requirement, prohibition, permission, process, penalty , exception , calculation , definition
-- action: the main behavior, requirement, restriction, or allowed act described in the text
-- result: the consequence, outcome, punishment, or follow-up stated in the text; use "" if none is stated
-
-Rules:
-- Extract one or more rules if present.
-- Keep wording close to the original text.
-- Do not invent facts.
-- If the text contains no clear rule, return {{"rules": []}}.
-
-Example:
-Text: Students must bring their student ID to the exam. Violators shall have five points deducted from their exam grade.
-Output:
-{{
-  "rules": [
-    {{
-      "type": "obligation",
-      "action": "Students must bring their student ID to the exam",
-      "result": "Violators shall have five points deducted from their exam grade"
-    }}
-  ]
-}}
-
-Example:
-Text: Students go to class.
-Output:
-{{
-  "rules": []
-}}
-
-Return JSON only in this format:
-{{
-  "rules": [
-    {{
-      "type": "...",
-      "action": "...",
-      "result": "..."
-    }}
-  ]
-}}
-
-Regulation name: {reg_name}
-Article reference: {article_number}
-
-Text:
-{content}
-""",
+            "content": (
+                "You are a legal data extractor. Your task is to extract rules from regulation text "
+                "into a structured JSON format. You must remain 100% faithful to the original wording.\n\n"
+                "FIELDS:\n"
+                "- type: EXACTLY one of: [obligation, prohibition, permission, penalty, procedure, other]\n"
+                "- action: The specific requirement, condition, or act (Verbatim from text).\n"
+                "- result: The specific consequence, outcome, or punishment (Verbatim from text). "
+                'If no consequence is mentioned, use "".\n\n'
+                "TYPE DEFINITIONS:\n"
+                "- obligation: Something that MUST or SHALL be done.\n"
+                "- prohibition: Something that MUST NOT or MAY NOT be done.\n"
+                "- permission: Something that MAY or IS ALLOWED.\n"
+                "- penalty: A punishment or specific consequence for a violation.\n"
+                "- procedure: Processes, deadlines, or application steps.\n"
+                "- other: Definitions or general scope statements.\n\n"
+                "STRICT RULES:\n"
+                "1. VERBATIM ONLY: Use the EXACT words from the original text. Do not paraphrase or summarize.\n"
+                "2. ATOMIC RULES: If a sentence contains two distinct requirements, create two separate rule objects.\n"
+                "3. WHITESPACE: Remove mid-sentence line breaks (\\n) but keep all punctuation and words.\n"
+                '4. NO INVENTIONS: If no clear rule exists, return {"rules": []}.\n\n'
+                "EXAMPLE:\n"
+                'Text: "Students must bring their ID to exams. Failure to do so will result in a 5-point deduction."\n'
+                "Output:\n"
+                "{\n"
+                '  "rules": [\n'
+                "    {\n"
+                '      "type": "obligation",\n'
+                '      "action": "Students must bring their ID to exams.",\n'
+                '      "result": "Failure to do so will result in a 5-point deduction."\n'
+                "    }\n"
+                "  ]\n"
+                "}\n\n"
+                "Return ONLY valid JSON."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Regulation: {reg_name}\nArticle: {article_number}\n\nText:\n{content}",
         },
     ]
 
-    return tokenizer.apply_chat_template(messages, tokenize=False)
+    # apply_chat_template formats the messages with the specific Qwen-2.5 tokens
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
 
 
 def parse_llm_response(response_text: str) -> Dict:
@@ -150,19 +208,17 @@ def normalize_text(text: str) -> str:
 
 
 def deduplicate_rules(rules: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """
-    Remove exact logical duplicates based on normalized action + result.
-    Keeps the first occurrence.
-    """
     seen = set()
     unique_rules = []
 
     for rule in rules:
-        action = normalize_text(rule.get("action", ""))
-        result = normalize_text(rule.get("result", ""))
-        key = (action, result)
+        key = (
+            normalize_text(rule.get("type", "")),
+            normalize_text(rule.get("action", "")),
+            normalize_text(rule.get("result", "")),
+        )
 
-        if not action:
+        if not rule.get("action"):
             continue
 
         if key in seen:
@@ -190,156 +246,65 @@ def make_rule_id(article_number: str, reg_name: str, action: str, result: str) -
     return f"rule_{digest}"
 
 
-def build_fallback_rules(article_number: str, content: str) -> List[Dict[str, str]]:
+def build_fallback_rules(
+    article_number: str, content: str, rule_type: str
+) -> List[Dict[str, str]]:
     """
-    Deterministic fallback: extract rules using pattern matching (no LLM).
-
-    Improvements:
-    - supports all target types:
-      eligibility, requirement, prohibition, permission, process, penalty , exception , calculation , definition"
-    - avoids overwriting a pending action before saving it
-    - flushes final pending action at the end
-    - allows penalty sentences to attach to the previous action
+    Deterministic fallback: splits content into sentences and emits one rule
+    per sentence. Type is already resolved — no keyword classification needed.
+    Consecutive consequence sentences are attached as the result of the prior action.
     """
-    rules: List[Dict[str, str]] = []
+    CONSEQUENCE_SIGNALS = [
+        "shall be",
+        "will be",
+        "must be",
+        "is subject to",
+        "shall result",
+        "penalty",
+        "deducted",
+        "expelled",
+        "revoked",
+        "forced to",
+        "zero grade",
+        "sanction",
+    ]
 
+    rules = []
     sentences = re.split(r"(?<=[\.\;\:])\s+", content)
 
     pending_action = ""
-    pending_type = ""
+    pending_result = ""
 
-    def add_rule(rule_type: str, action: str, result: str = "") -> None:
-        action = action.strip()
-        result = result.strip()
-        if not action:
-            return
-        rules.append(
-            {
-                "type": rule_type,
-                "action": action,
-                "result": result,
-                "art_ref": article_number,
-            }
-        )
-
-    def flush_pending() -> None:
-        nonlocal pending_action, pending_type
-        if pending_action:
-            add_rule(pending_type or "other", pending_action, "")
-            pending_action = ""
-            pending_type = ""
-
-    def classify_sentence(s: str) -> str:
-        if any(
-            x in s
-            for x in [
-                "violators shall",
-                "shall be punished",
-                "shall receive",
-                "will receive",
-                "subject to disciplinary action",
-                "shall be subject to",
-                "will be subject to",
-                "penalty",
-                "punishment",
-                "deducted from",
-            ]
-        ):
-            return "penalty"
-
-        if any(
-            x in s
-            for x in [
-                "must",
-                "shall",
-                "is required to",
-                "are required to",
-                "has to",
-                "have to",
-            ]
-        ):
-            return "obligation"
-
-        if any(
-            x in s
-            for x in [
-                "not permitted",
-                "may not",
-                "shall not",
-                "must not",
-                "are not permitted",
-                "is prohibited",
-                "are prohibited",
-                "cannot",
-            ]
-        ):
-            return "prohibition"
-
-        if any(
-            x in s
-            for x in [
-                "may",
-                "is allowed to",
-                "are allowed to",
-                "is permitted to",
-                "are permitted to",
-            ]
-        ):
-            return "permission"
-
-        if any(
-            x in s
-            for x in [
-                "submit",
-                "apply",
-                "register",
-                "complete",
-                "fill out",
-                "provide",
-                "attach",
-                "follow the procedure",
-                "according to the procedure",
-                "within",
-                "before",
-                "after",
-                "by the deadline",
-            ]
-        ):
-            return "procedure"
-
-        return "other"
+    def flush():
+        nonlocal pending_action, pending_result
+        if pending_action.strip():
+            rules.append(
+                {
+                    "type": rule_type,
+                    "action": pending_action.strip(),
+                    "result": pending_result.strip(),
+                    "art_ref": article_number,
+                }
+            )
+        pending_action, pending_result = "", ""
 
     for sent in sentences:
-        sent = sent.strip()
-        s = sent.lower()
-
-        if not s or len(s) < 10:
+        s = sent.strip()
+        if len(s) < 10:
             continue
 
-        sent_type = classify_sentence(s)
+        low = s.lower()
+        is_consequence = any(sig in low for sig in CONSEQUENCE_SIGNALS)
 
-        if sent_type == "penalty":
-            if pending_action:
-                add_rule("penalty", pending_action, sent)
-                pending_action = ""
-                pending_type = ""
-            else:
-                add_rule("penalty", sent, "")
-            continue
+        if is_consequence and pending_action:
+            pending_result = s
+            flush()
+        else:
+            flush()
+            pending_action = s
+            pending_result = ""
 
-        if sent_type in {
-            "obligation",
-            "prohibition",
-            "permission",
-            "procedure",
-            "other",
-        }:
-            flush_pending()
-            pending_action = sent
-            pending_type = sent_type
-            continue
-
-    flush_pending()
+    flush()
     return rules
 
 
@@ -426,7 +391,7 @@ def finalize_graph(driver) -> None:
         session.run(
             """
             CREATE FULLTEXT INDEX rule_idx IF NOT EXISTS
-            FOR (z:Rule) ON EACH [z.action, z.result]
+            FOR (z:Rule) ON EACH [z.action, z.result, z.type]
             """
         )
 
@@ -453,6 +418,15 @@ def finalize_graph(driver) -> None:
 
 def build_graph() -> None:
     """Build KG from SQLite into Neo4j using the fixed assignment schema."""
+    VALID_TYPES = {
+        "obligation",
+        "prohibition",
+        "permission",
+        "penalty",
+        "procedure",
+        "other",
+    }
+
     sql_conn = sqlite3.connect("ncu_regulations.db")
     cursor = sql_conn.cursor()
     driver = GraphDatabase.driver(URI, auth=AUTH)
@@ -466,6 +440,12 @@ def build_graph() -> None:
     reg_map: dict[int, tuple[str, str]] = {
         reg_id: (name, category) for reg_id, name, category in regulations
     }
+
+    # Print resolved fallback types at startup so you can verify
+    print("[Fallback type mapping from reg_name]")
+    for reg_id, (name, _) in reg_map.items():
+        print(f"  reg_id={reg_id} | {name!r} → {resolve_type(name)}")
+    print()
 
     cursor.execute("SELECT reg_id, article_number, content FROM articles")
     articles = cursor.fetchall()
@@ -493,22 +473,27 @@ def build_graph() -> None:
         for (_, article_number, content, reg_name), result in zip(
             batch_meta, batch_results
         ):
+            fallback_type = resolve_type(reg_name)
             rules = result.get("rules", [])
 
             if not rules:
-                rules = build_fallback_rules(article_number, content)
+                rules = build_fallback_rules(article_number, content, fallback_type)
 
             clean_rules = []
             for r in rules:
                 action = r.get("action", "").strip()
                 result_text = r.get("result", "").strip()
+                # Use LLM's type if valid, otherwise fall back to reg_name-derived type
+                rule_type = r.get("type", "").strip()
+                if rule_type not in VALID_TYPES:
+                    rule_type = fallback_type
 
                 if not action:
                     continue
 
                 clean_rules.append(
                     {
-                        "type": r.get("type", "unknown"),
+                        "type": rule_type,
                         "action": action,
                         "result": result_text,
                         "art_ref": article_number,
@@ -521,10 +506,10 @@ def build_graph() -> None:
             # progress print
             processed_articles += 1
             print(
-                f"[Progress] processed {processed_articles}/{total_articles} articles | Article {article_number}"
+                f"[Progress] processed {processed_articles}/{total_articles} articles"
+                f" | Article {article_number}"
             )
 
-            # quick rule preview
             if clean_rules:
                 print("  Rules:")
                 for idx, r in enumerate(clean_rules, start=1):

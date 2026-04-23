@@ -5,6 +5,10 @@ from typing import Dict, Any
 from dotenv import load_dotenv
 from neo4j import GraphDatabase
 
+# nltk for word variations
+import nltk
+from nltk.corpus import wordnet
+
 from llm_loader import load_local_llm, get_tokenizer, get_raw_pipeline
 
 
@@ -30,14 +34,10 @@ except Exception as e:
     print(f"⚠️ Neo4j connection warning: {e}")
     driver = None
 
-# $$$$$$$$ NEW PART $$$$$$$$
-
 if driver is None:
     print("\n❌ Neo4j driver is NOT connected. Retrieval will return empty results.\n")
 else:
     print("\n✅ Neo4j driver connected successfully.\n")
-
-    # quick sanity check query
     try:
         with driver.session() as session:
             test = session.run("RETURN 1 AS ok")
@@ -45,449 +45,29 @@ else:
     except Exception as e:
         print(f"❌ DB test query failed: {e}")
 
-# $$$$$$$$ NEW PART $$$$$$$$
+# Download wordnet data if not already present
+try:
+    nltk.data.find("corpora/wordnet")
+except LookupError:
+    print("[nltk] Downloading wordnet...")
+    nltk.download("wordnet")
+    nltk.download("omw-1.4")
 
+
+# ========== 1) Constants ==========
 
 ALLOWED_TYPES = {
-    "eligibility",
-    "requirement",
+    "obligation",
     "prohibition",
     "permission",
-    "process",
     "penalty",
-    "exception",
-    "calculation",
-    "definition",
+    "procedure",
+    "other",
 }
 
-
-def count_words(text: str) -> int:
-    if not text or not text.strip():
-        return 0
-    return len(re.findall(r"\b[\w'-]+\b", text.strip()))
-
-
-def ensure_llm_loaded() -> None:
-    """
-    Make sure tokenizer and pipeline are initialized.
-    """
-    if get_tokenizer() is None or get_raw_pipeline() is None:
-        load_local_llm()
-
-
-def build_prompt(user_input: str, profile: str, schema_description: str) -> str:
-    ensure_llm_loaded()
-
-    tokenizer = get_tokenizer()
-    messages = [
-        {
-            "role": "system",
-            "content": f"""
-You are a strict JSON generator.
-
-Profile:
-{profile}
-
-Schema:
-{schema_description}
-
-Task:
-Read the user input and return exactly one JSON object with these fields:
-- type
-- action
-- result
-
-Rules:
-- type must be exactly one of: eligibility, requirement, prohibition, permission, process, penalty , exception , calculation , definition
-- action must be less than 7 words
-- result must be less than 7 words, or "" if no clear result is stated
-- return JSON only
-- do not include markdown
-- do not include explanations
-- do not include extra keys
-- Do not use short words like mins, use full word like minutes.
-- Every JSON string value must be wrapped in double quotes
-- Output must be valid JSON parsable by Python json.loads
-
-
-Example input and output:
-
-Example 1
-User input:
-What is the penalty for being late to class?
-System Output:
-{{
-  "type": "consequence",
-  "action": "be late to class",
-  "result": "what is the consequence"
-}}
-
-Example 2
-User input:
-How can I renew my ID card?
-System Output:
-{{
-  "type": "process",
-  "action": "steps to renew ID",
-  "result": "Get new ID card"
-}}
-
-
-Example 3
-User input:
-What happens if I dont pay my tuition?
-System Output:
-{{
-  "type": "penalty",
-  "action": "not paying tuition",
-  "result": "penalty or not paying".
-}}
-
-
-User input:
-{user_input}
-""".strip(),
-        }
-    ]
-
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-
-def read_pipeline_text_output(raw_response: Any) -> str:
-    """
-    Extract generated text from a Hugging Face pipeline response.
-    """
-    if isinstance(raw_response, list):
-        if not raw_response:
-            return ""
-        first = raw_response[0]
-        if isinstance(first, dict):
-            return first.get("generated_text", "")
-        return str(first)
-
-    if isinstance(raw_response, dict):
-        return raw_response.get("generated_text", "")
-
-    return str(raw_response)
-
-
-def call_llm_once(prompt: str) -> str:
-    """
-    Send one prompt to the LLM and return raw text.
-    """
-    ensure_llm_loaded()
-
-    llm = get_raw_pipeline()
-    raw_response = llm(prompt)
-    return read_pipeline_text_output(raw_response)
-
-
-def parse_json_text(response_text: str) -> Dict[str, Any]:
-    """
-    Parse the LLM's JSON text into a Python dict.
-    """
-    response_text = response_text.strip()
-    return json.loads(response_text)
-
-
-def validate_output(data: Dict[str, Any]) -> None:
-    """
-    Raise ValueError if the parsed output does not match the schema.
-    """
-    required_keys = {"type", "action", "result"}
-    actual_keys = set(data.keys())
-
-    print("\n--- VALIDATION START ---")  # $$$$$$$$ NEW PART $$$$$$$$
-
-    missing = required_keys - actual_keys
-    extra = actual_keys - required_keys
-
-    print(f"[CHECK] keys present: {actual_keys}")  # $$$$$$$$ NEW PART $$$$$$$$
-
-    if missing:
-        print(f"[FAIL] missing keys: {missing}")  # $$$$$$$$ NEW PART $$$$$$$$
-        raise ValueError(f"Missing keys: {sorted(missing)}")
-    else:
-        print("[PASS] required keys present")  # $$$$$$$$ NEW PART $$$$$$$$
-
-    if extra:
-        print(f"[FAIL] unexpected keys: {extra}")  # $$$$$$$$ NEW PART $$$$$$$$
-        raise ValueError(f"Unexpected keys: {sorted(extra)}")
-    else:
-        print("[PASS] no extra keys")  # $$$$$$$$ NEW PART $$$$$$$$
-
-    if not isinstance(data["type"], str):
-        print(
-            f"[FAIL] type is not string: {data['type']}"
-        )  # $$$$$$$$ NEW PART $$$$$$$$
-        raise ValueError("type must be a string")
-
-    type_value = data["type"].strip().lower()
-    print(f"[CHECK] type value: '{type_value}'")  # $$$$$$$$ NEW PART $$$$$$$$
-
-    if type_value not in ALLOWED_TYPES:
-        print(f"[FAIL] invalid type: '{type_value}'")  # $$$$$$$$ NEW PART $$$$$$$$
-        raise ValueError(f"type must be one of: {sorted(ALLOWED_TYPES)}")
-    else:
-        print("[PASS] type is valid")  # $$$$$$$$ NEW PART $$$$$$$$
-
-    if not isinstance(data["action"], str):
-        print(
-            f"[FAIL] action not string: {data['action']}"
-        )  # $$$$$$$$ NEW PART $$$$$$$$
-        raise ValueError("action must be a string")
-
-    action_wc = count_words(data["action"])
-    print(
-        f"[CHECK] action: '{data['action']}' | words={action_wc}"
-    )  # $$$$$$$$ NEW PART $$$$$$$$
-
-    if action_wc > 6:
-        print("[FAIL] action too long")  # $$$$$$$$ NEW PART $$$$$$$$
-        raise ValueError("action must contain fewer than 7 words")
-    else:
-        print("[PASS] action word count valid")  # $$$$$$$$ NEW PART $$$$$$$$
-
-    if not isinstance(data["result"], str):
-        print(
-            f"[FAIL] result not string: {data['result']}"
-        )  # $$$$$$$$ NEW PART $$$$$$$$
-        raise ValueError("result must be a string")
-
-    result_wc = count_words(data["result"])
-    print(
-        f"[CHECK] result: '{data['result']}' | words={result_wc}"
-    )  # $$$$$$$$ NEW PART $$$$$$$$
-
-    if data["result"] != "" and result_wc > 6:
-        print("[FAIL] result too long")  # $$$$$$$$ NEW PART $$$$$$$$
-        raise ValueError('result must contain fewer than 7 words or be ""')
-    else:
-        print("[PASS] result word count valid")  # $$$$$$$$ NEW PART $$$$$$$$
-
-    print("--- VALIDATION PASSED ---\n")  # $$$$$$$$ NEW PART $$$$$$$$
-
-
-def classify_user_input(
-    user_input: str,
-    profile: str,
-    schema_description: str,
-) -> Dict[str, str]:
-    """
-    Flow:
-    1. Build prompt
-    2. Send prompt to LLM
-    3. Get JSON text back
-    4. Parse JSON text into Python dict
-    5. Validate fields
-    6. Return final dict
-    """
-    prompt = build_prompt(
-        user_input=user_input,
-        profile=profile,
-        schema_description=schema_description,
-    )
-
-    # @@@
-    # print("\n--- PROMPT SENT TO LLM ---")
-    # print(prompt)
-    # print("--------------------------\n")
-
-    response_text = call_llm_once(prompt)
-
-    print("\n--- RAW LLM OUTPUT ---")
-    print(response_text)
-    print("----------------------\n")
-
-    data = parse_json_text(response_text)
-    data = validate_or_repair(data)
-
-    return data
-
-
-from typing import Any
-
-# $$$$$$$$ NEW PART $$$$$$$$
-
-
-def build_typed_cypher(entities: dict[str, Any]) -> tuple[str, str]:
-    """
-    Build two Cypher queries from already-validated entities JSON.
-
-    Branching logic:
-    - if action is empty and result is empty: use type only
-    - if action is empty: use type + result tokens
-    - if result is empty: use type + action tokens
-    - else: use type + action tokens + result tokens
-    """
-
-    action = str(entities.get("action", "") or "").strip().lower()
-    result = str(entities.get("result", "") or "").strip().lower()
-
-    use_action = action != ""
-    use_result = result != ""
-
-    if use_action and use_result:
-        cypher_typed = """
-MATCH p = (z:Rule)
-WHERE z.type = $type
-  AND ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
-  AND ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
-RETURN p,
-       z.rule_id AS rule_id,
-       z.type AS type,
-       z.action AS action,
-       z.result AS result,
-       z.art_ref AS art_ref,
-       z.reg_name AS reg_name,
-       3 AS score
-ORDER BY score DESC, rule_id
-LIMIT 10
-"""
-        cypher_broad = """
-MATCH p = (z:Rule)
-WHERE z.type = $type
-  AND (
-        ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
-        OR
-        ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
-      )
-RETURN p,
-       z.rule_id AS rule_id,
-       z.type AS type,
-       z.action AS action,
-       z.result AS result,
-       z.art_ref AS art_ref,
-       z.reg_name AS reg_name,
-       CASE
-         WHEN ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
-          AND ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word) THEN 3
-         WHEN ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
-           OR ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word) THEN 2
-         ELSE 1
-       END AS score
-ORDER BY score DESC, rule_id
-LIMIT 15
-"""
-
-    elif use_action:
-        cypher_typed = """
-MATCH p = (z:Rule)
-WHERE z.type = $type
-  AND ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
-RETURN p,
-       z.rule_id AS rule_id,
-       z.type AS type,
-       z.action AS action,
-       z.result AS result,
-       z.art_ref AS art_ref,
-       z.reg_name AS reg_name,
-       2 AS score
-ORDER BY score DESC, rule_id
-LIMIT 10
-"""
-        cypher_broad = """
-MATCH p = (z:Rule)
-WHERE z.type = $type
-   OR ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
-RETURN p,
-       z.rule_id AS rule_id,
-       z.type AS type,
-       z.action AS action,
-       z.result AS result,
-       z.art_ref AS art_ref,
-       z.reg_name AS reg_name,
-       CASE
-         WHEN z.type = $type
-          AND ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word) THEN 2
-         WHEN z.type = $type
-           OR ANY(word IN $action_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word) THEN 1
-         ELSE 0
-       END AS score
-ORDER BY score DESC, rule_id
-LIMIT 15
-"""
-
-    elif use_result:
-        cypher_typed = """
-MATCH p = (z:Rule)
-WHERE z.type = $type
-  AND ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
-RETURN p,
-       z.rule_id AS rule_id,
-       z.type AS type,
-       z.action AS action,
-       z.result AS result,
-       z.art_ref AS art_ref,
-       z.reg_name AS reg_name,
-       2 AS score
-ORDER BY score DESC, rule_id
-LIMIT 10
-"""
-        cypher_broad = """
-MATCH p = (z:Rule)
-WHERE z.type = $type
-   OR ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
-RETURN p,
-       z.rule_id AS rule_id,
-       z.type AS type,
-       z.action AS action,
-       z.result AS result,
-       z.art_ref AS art_ref,
-       z.reg_name AS reg_name,
-       CASE
-         WHEN z.type = $type
-          AND ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word) THEN 2
-         WHEN z.type = $type
-           OR ANY(word IN $result_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word) THEN 1
-         ELSE 0
-       END AS score
-ORDER BY score DESC, rule_id
-LIMIT 15
-"""
-
-    else:
-        cypher_typed = """
-MATCH p = (z:Rule)
-WHERE z.type = $type
-RETURN p,
-       z.rule_id AS rule_id,
-       z.type AS type,
-       z.action AS action,
-       z.result AS result,
-       z.art_ref AS art_ref,
-       z.reg_name AS reg_name,
-       1 AS score
-ORDER BY score DESC, rule_id
-LIMIT 10
-"""
-        cypher_broad = """
-MATCH p = (z:Rule)
-WHERE z.type = $type
-RETURN p,
-       z.rule_id AS rule_id,
-       z.type AS type,
-       z.action AS action,
-       z.result AS result,
-       z.art_ref AS art_ref,
-       z.reg_name AS reg_name,
-       1 AS score
-ORDER BY score DESC, rule_id
-LIMIT 15
-"""
-
-    return cypher_typed, cypher_broad
-
-
-# $$$$$$$$ NEW PART $$$$$$$$
-
-# $$$$$$$$ NEW PART $$$$$$$$
-
+# Words removed before tokenization — functional/structural words with no search value
 STOPWORDS = {
+    # articles and conjunctions
     "the",
     "a",
     "an",
@@ -504,88 +84,205 @@ STOPWORDS = {
     "are",
     "was",
     "were",
-    "x",
     "will",
     "shall",
     "should",
     "can",
     "could",
+    # pronouns
+    "my",
+    "me",
+    "i",
+    "we",
+    "us",
+    "you",
+    "he",
+    "she",
+    "they",
+    "them",
+    "their",
+    "his",
+    "her",
+    "its",
+    # question words
+    "do",
+    "how",
+    "what",
+    "when",
+    "where",
+    "why",
+    "who",
+    "which",
+    # prepositions
+    "if",
+    "for",
+    "in",
+    "on",
+    "at",
+    "by",
+    "with",
+    "about",
+    "this",
+    "that",
+    "it",
+    "not",
+    "no",
+    "yes",
+    # common verbs with no search value
+    "get",
+    "got",
+    "have",
+    "has",
+    "had",
+    "been",
+    # quantifiers and determiners
+    "any",
+    "all",
+    "some",
+    "would",
+    "may",
+    "might",
+    "also",
+    "many",
+    "much",
+    "few",
+    "each",
+    "such",
+    "per",
+    # time/order words too generic to search
+    "before",
+    "after",
+    "during",
+    "while",
+    "until",
+    "since",
+    "these",
+    "those",
+    "then",
+    "than",
+    "just",
+    "only",
+    # single letters and noise
+    "x",
 }
+
+# Generic domain words — appear in almost every rule, expand last to save token slots
+LOW_PRIORITY_EXPAND = {
+    "student",
+    "students",
+    "exam",
+    "exams",
+    "course",
+    "courses",
+    "university",
+    "ncu",
+    "school",
+    "semester",
+    "academic",
+    "study",
+    "studies",
+    "rule",
+    "rules",
+    "regulation",
+    "regulations",
+    "article",
+    "department",
+    "program",
+    "degree",
+}
+
+# Max total tokens after expansion (configurable)
+MAX_EXPANDED_TOKENS = 50
+
+# Weight multiplier for base tokens vs expanded tokens
+BASE_TOKEN_WEIGHT = 3
+
+
+# ========== 2) Helpers ==========
+
+
+def count_words(text: str) -> int:
+    if not text or not text.strip():
+        return 0
+    return len(re.findall(r"\b[\w'-]+\b", text.strip()))
 
 
 def tokenize_for_retrieval(text: str) -> list[str]:
+    """
+    Tokenize raw text — split into words, lowercase,
+    remove stopwords and very short tokens.
+    No summarization — all meaningful words are kept.
+    """
     tokens = re.findall(r"\b[\w'-]+\b", text.lower())
     return [t for t in tokens if len(t) > 2 and t not in STOPWORDS]
 
 
-# $$$$$$$$ NEW PART $$$$$$$$
+def ensure_llm_loaded() -> None:
+    if get_tokenizer() is None or get_raw_pipeline() is None:
+        load_local_llm()
 
 
-def build_typed_params(entities: dict[str, Any]) -> dict[str, Any]:
-    # $$$$$$$$ NEW PART $$$$$$$$
-    action_tokens = tokenize_for_retrieval(entities["action"])
-    result_tokens = tokenize_for_retrieval(entities["result"])
-
-    print("\n=== TOKEN DEBUG ===")
-    print("Raw action:", entities["action"])
-    print("Action tokens:", action_tokens)
-    print("Raw result:", entities["result"])
-    print("Result tokens:", result_tokens)
-    # $$$$$$$$ NEW PART $$$$$$$$
-
-    return {
-        "type": entities["type"].strip().lower(),
-        # $$$$$$$$ NEW PART $$$$$$$$
-        "action_tokens": action_tokens,
-        "result_tokens": result_tokens,
-        # $$$$$$$$ NEW PART $$$$$$$$
-    }
+# ========== 3) Type Classification ==========
 
 
-import json
-from typing import Dict, Any
-
-
-def build_repair_prompt(data: Dict[str, Any]) -> str:
+def build_type_classification_prompt(user_input: str) -> str:
     ensure_llm_loaded()
-
     tokenizer = get_tokenizer()
     messages = [
         {
             "role": "system",
             "content": f"""
-You are a strict JSON repairer.
+You are a strict classifier.
 
 Task:
-You will receive a JSON object with fields:
+Read the user input and return exactly one JSON object with ONE field only:
 - type
-- action
-- result
 
-Your job is to rewrite it so it passes the schema rules below.
+Rules:
+- type must be exactly one of: obligation, prohibition, permission, penalty, procedure, other
+- return JSON only
+- do not include markdown
+- do not include explanations
+- do not include any other keys
 
-Schema rules:
-- Output must remain a JSON object with exactly these keys:
-  - type
-  - action
-  - result
-- type must be exactly one of:
-  eligibility, requirement, prohibition, permission, process, penalty , exception , calculation , definition"
-- If type is invalid, replace it with the closest valid type.
-- action must contain fewer than 6 words.
-- result must contain fewer than 6 words, or be "".
-- Keep the meaning as close as possible.
-- Do not add extra keys.
-- Return JSON only.
-- Do not use markdown.
-- Do not explain.
+Type definitions:
+- obligation: the question asks about something that MUST or SHALL be done (e.g. requirements, mandatory actions, duties).
+- prohibition: the question asks about something that is NOT allowed or MUST NOT be done (e.g. banned behaviors, restrictions).
+- permission: the question asks whether something IS allowed or MAY be done (e.g. "can I...", "am I allowed to...").
+- penalty: the question asks about consequences, punishments, or deductions for violations (e.g. "what happens if I...", "what is the penalty for...").
+- procedure: the question asks about steps, deadlines, processes, approvals, or how to apply for something (e.g. "how do I...", "what is the process for...").
+- other: definitions, scope, or anything that does not fit above.
 
-Input JSON:
-{json.dumps(data, ensure_ascii=False, indent=2)}
+Example input and output:
+
+Example 1
+User input: How many minutes late can a student be before they are barred from the exam?
+Output: {{"type": "penalty"}}
+
+Example 2
+User input: How can I renew my ID card?
+Output: {{"type": "procedure"}}
+
+Example 3
+User input: Can I count my military training credits towards graduation?
+Output: {{"type": "permission"}}
+
+Example 4
+User input: What happens if I am caught cheating in an exam?
+Output: {{"type": "penalty"}}
+
+Example 5
+User input: What must I bring to the exam?
+Output: {{"type": "obligation"}}
+
+Example 6
+User input: Am I allowed to leave the exam room early?
+Output: {{"type": "permission"}}
+
+User input: {user_input}
 """.strip(),
         }
     ]
-
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -593,226 +290,523 @@ Input JSON:
     )
 
 
-def repair_with_llm(data: Dict[str, Any]) -> Dict[str, Any]:
+def read_pipeline_text_output(raw_response: Any) -> str:
+    if isinstance(raw_response, list):
+        if not raw_response:
+            return ""
+        first = raw_response[0]
+        if isinstance(first, dict):
+            return first.get("generated_text", "")
+        return str(first)
+    if isinstance(raw_response, dict):
+        return raw_response.get("generated_text", "")
+    return str(raw_response)
+
+
+def call_llm_once(prompt: str) -> str:
+    ensure_llm_loaded()
+    llm = get_raw_pipeline()
+    raw_response = llm(prompt)
+    return read_pipeline_text_output(raw_response)
+
+
+def parse_json_text(response_text: str) -> Dict[str, Any]:
+    response_text = response_text.strip()
+    return json.loads(response_text)
+
+
+def classify_type(user_input: str) -> str:
     """
-    Send invalid parsed data to the LLM and ask it to rewrite the JSON
-    so it passes validation.
+    Ask the LLM to classify the question into one of the allowed types.
+    Returns the type string. Falls back to "other" if classification fails.
     """
-    prompt = build_repair_prompt(data)
+    prompt = build_type_classification_prompt(user_input)
     response_text = call_llm_once(prompt)
 
-    print("\n--- REPAIR PROMPT SENT TO LLM ---")
-    print(prompt)
-    print("---------------------------------\n")
-
-    print("\n--- RAW REPAIRED LLM OUTPUT ---")
+    print("\n--- TYPE CLASSIFICATION OUTPUT ---")
     print(response_text)
-    print("-------------------------------\n")
+    print("----------------------------------\n")
 
-    repaired_data = parse_json_text(response_text)
-    return repaired_data
-
-
-def validate_or_repair(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    First try normal validation.
-    If ValueError happens, repair with LLM and validate again.
-    """
     try:
-        validate_output(data)
-        return data
-    except ValueError as e:
-        print(f"\nValidation failed: {e}")
-        print("Attempting LLM repair...\n")
+        data = parse_json_text(response_text)
+        type_value = str(data.get("type", "")).strip().lower()
 
-    repaired_data = repair_with_llm(data)
-    validate_output(repaired_data)
-    return repaired_data
+        if type_value not in ALLOWED_TYPES:
+            print(
+                f"[classify_type] Invalid type '{type_value}', falling back to 'other'"
+            )
+            return "other"
 
+        print(f"[classify_type] Classified as: '{type_value}'")
+        return type_value
 
-# $$$$$$$$ NEW PART $$$$$$$$
-
-
-def _tokenize_for_overlap(text: str) -> set[str]:
-    if not text:
-        return set()
-    return set(re.findall(r"\b[\w'-]+\b", text.lower()))
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"[classify_type] Parse error: {e}, falling back to 'other'")
+        return "other"
 
 
-def _compute_python_rank(row: dict[str, Any], entities: dict[str, Any]) -> int:
-    """
-    Python-side reranking.
+# ========== 4) Token Expansion ==========
 
-    Score components:
-    - typed source gets a strong boost
-    - DB score still matters
-    - token overlap on action/result refines ranking
-    """
-    source = str(row.get("source", "") or "").strip().lower()
-    db_score = int(row.get("score", 0) or 0)
 
-    query_action_tokens = _tokenize_for_overlap(str(entities.get("action", "") or ""))
-    query_result_tokens = _tokenize_for_overlap(str(entities.get("result", "") or ""))
+def _get_wordnet_variations(token: str) -> list[str]:
+    variations = set()
+    for synset in wordnet.synsets(token):
+        for lemma in synset.lemmas():
+            word = lemma.name().replace("_", " ").lower()
+            if len(word.split()) == 1 and len(word) > 2:
+                variations.add(word)
+    variations.discard(token.lower())
+    return list(variations)
 
-    row_action_tokens = _tokenize_for_overlap(str(row.get("action", "") or ""))
-    row_result_tokens = _tokenize_for_overlap(str(row.get("result", "") or ""))
 
-    action_overlap = len(query_action_tokens & row_action_tokens)
-    result_overlap = len(query_result_tokens & row_result_tokens)
+def _build_synonym_prompt(token: str) -> str:
+    return f"""You are a language expansion assistant for a university regulation search engine.
 
-    source_boost = 100 if source == "typed" else 0
+For the word "{token}" in the context of university academic regulations, generate:
+- synonyms
+- word variations (plural, singular, verb forms, adjective forms, noun forms)
+- related terms used in academic or legal documents
 
-    return (
-        source_boost + (30 * db_score) + (10 * action_overlap) + (10 * result_overlap)
+Rules:
+- Return a flat JSON array of strings only
+- All words must be lowercase
+- No duplicates
+- No explanations
+- No markdown
+- Do not include the original word "{token}" in the output
+
+Example output format:
+["word1", "word2", "word3"]
+
+Word to expand: "{token}"
+"""
+
+
+def _parse_llm_expansion(response_text: str) -> list[str]:
+    try:
+        clean = re.sub(r"```[a-z]*", "", response_text).replace("```", "").strip()
+        match = re.search(r"\[.*?\]", clean, re.DOTALL)
+        if not match:
+            print(f"[expansion] No JSON array found in: {response_text[:100]}")
+            return []
+        raw = match.group()
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            print(f"[expansion] JSON parse failed, attempting bare-word recovery")
+            parsed = re.findall(r"[\w'-]+", raw)
+        return [
+            str(w).strip().lower()
+            for w in parsed
+            if isinstance(w, str) and len(w.strip()) > 2
+        ]
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"[expansion] Parse error: {e} | text: {response_text[:100]}")
+        return []
+
+
+def _expand_token_with_llm(token: str) -> list[str]:
+    ensure_llm_loaded()
+    prompt = _build_synonym_prompt(token)
+    tok = get_tokenizer()
+    messages = [{"role": "user", "content": prompt}]
+    formatted_prompt = tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
     )
+    llm = get_raw_pipeline()
+    raw = llm(formatted_prompt, max_new_tokens=300)
+    if isinstance(raw, list) and raw:
+        response_text = raw[0].get("generated_text", "")
+    else:
+        response_text = str(raw)
+    expanded = _parse_llm_expansion(response_text)
+    print(f"  [LLM expand] '{token}' → {expanded}")
+    return expanded
 
 
-def _run_query_with_source(
-    query: str,
-    params: dict[str, Any],
-    source: str,
+def expand_tokens(
+    tokens: list[str],
+    max_total: int = MAX_EXPANDED_TOKENS,
+) -> list[str]:
+    """
+    Expand tokens using WordNet + LLM synonyms.
+
+    Key behaviors:
+    1. Specific/rare tokens expand first (LOW_PRIORITY_EXPAND tokens expand last)
+       so cap doesn't prevent important tokens like "barred" from expanding.
+    2. Original tokens always preserved in final list.
+    3. Total capped at max_total.
+
+    Example priority order for "minutes late student barred exam":
+        high priority (expand first): "minutes", "late", "barred"
+        low priority (expand last):   "student", "exam"
+    """
+    print(f"\n=== TOKEN EXPANSION (max={max_total}) ===")
+    print(f"Original tokens: {tokens}")
+
+    # Sort: specific tokens first, generic (LOW_PRIORITY) tokens last
+    sorted_tokens = sorted(tokens, key=lambda t: t in LOW_PRIORITY_EXPAND)
+    print(f"Expansion order: {sorted_tokens}")
+
+    expanded_set = set(tokens)
+    ordered = list(tokens)  # original tokens always preserved first
+
+    for token in sorted_tokens:
+        print(f"\n[expanding] '{token}'")
+        wn_variations = _get_wordnet_variations(token)
+        print(f"  [WordNet] '{token}' → {wn_variations}")
+        llm_synonyms = _expand_token_with_llm(token)
+
+        for word in wn_variations + llm_synonyms:
+            word = word.strip().lower()
+            if word and word not in expanded_set and word not in STOPWORDS:
+                expanded_set.add(word)
+                ordered.append(word)
+
+        if len(ordered) >= max_total:
+            print(f"  [cap] Reached max_total={max_total}, stopping early.")
+            break
+
+    # Always preserve originals — fill remaining slots with expansions
+    original_set = set(tokens)
+    expansions = [t for t in ordered if t not in original_set]
+    slots = max(0, max_total - len(tokens))
+    final = tokens + expansions[:slots]
+
+    print(f"\n=== EXPANSION RESULT ===")
+    print(f"Original count : {len(tokens)}")
+    print(f"Expanded count : {len(final)}")
+    print(f"Original tokens guaranteed: {tokens}")
+    print(f"Expanded tokens: {final}")
+
+    return final
+
+
+# ========== 5) Params Builder ==========
+
+
+def build_voting_params(
+    user_q: str,
+    question_type: str,
+    max_total: int = MAX_EXPANDED_TOKENS,
+) -> dict[str, Any]:
+    base_tokens = tokenize_for_retrieval(user_q)
+
+    print("\n=== TOKEN DEBUG ===")
+    print("Raw question :", user_q)
+    print("Base tokens  :", base_tokens)
+
+    expanded_tokens = expand_tokens(base_tokens, max_total=max_total)
+
+    return {
+        "type": question_type,
+        "base_tokens": base_tokens,
+        "all_tokens": expanded_tokens,
+    }
+
+
+# ========== 6) Cypher Queries ==========
+
+
+def build_voting_cypher() -> str:
+    """
+    Returns Rule nodes where at least one base token matches
+    AND at least one expanded token matches.
+    base_tokens must match to ensure relevance.
+    all_tokens broadens the net for scoring.
+    """
+    return """
+MATCH (z:Rule)
+WHERE (
+    ANY(word IN $base_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
+    OR
+    ANY(word IN $base_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
+  )
+  AND (
+    ANY(word IN $all_tokens WHERE toLower(coalesce(z.action, "")) CONTAINS word)
+    OR
+    ANY(word IN $all_tokens WHERE toLower(coalesce(z.result, "")) CONTAINS word)
+  )
+RETURN
+    z.rule_id  AS rule_id,
+    z.type     AS type,
+    z.action   AS action,
+    z.result   AS result,
+    z.art_ref  AS art_ref,
+    z.reg_name AS reg_name
+"""
+
+
+def build_article_content_cypher() -> str:
+    return """
+MATCH (a:Article)
+WHERE a.number IN $art_refs
+RETURN
+    a.number   AS art_ref,
+    a.content  AS content
+"""
+
+
+# ========== 7) Vote Scoring ==========
+
+
+def _compute_vote_score(
+    row: dict[str, Any],
+    base_tokens: list[str],
+    all_tokens: list[str],
+) -> int:
+    """
+    Count weighted token matches in rule's action + result fields.
+
+    Base tokens (original question words) are worth BASE_TOKEN_WEIGHT (3x).
+    Expanded tokens (synonyms/variations) are worth 1x.
+
+    A token can score in both action and result fields.
+
+    Example:
+        base_tokens = ["minutes", "late", "barred", "exam"]
+        Rule 4 action = "Students arriving more than 20 minutes..."
+            "minutes" → base → weight=3 ✅
+            "exam"    → base → weight=3 ✅
+            total = 6  (+ expanded token matches on top)
+
+        Article 19 rule = "late submission of grades"
+            "late"    → base → weight=3 ✅
+            total = 3
+    """
+    row_action = str(row.get("action", "") or "").lower()
+    row_result = str(row.get("result", "") or "").lower()
+
+    base_set = set(base_tokens)
+    votes = 0
+
+    for token in all_tokens:
+        weight = BASE_TOKEN_WEIGHT if token in base_set else 1
+        if token in row_action:
+            votes += weight
+        if token in row_result:
+            votes += weight
+
+    return votes
+
+
+def _rank_by_votes(
+    rows: list[dict[str, Any]],
+    base_tokens: list[str],
+    all_tokens: list[str],
 ) -> list[dict[str, Any]]:
     """
-    Run one Cypher query and tag each row with its source.
+    Score each rule by weighted vote count, dedupe by rule_id, sort descending.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        rule_id = str(row.get("rule_id", "") or "").strip()
+        if not rule_id:
+            continue
+        row["vote_score"] = _compute_vote_score(row, base_tokens, all_tokens)
+        if rule_id not in merged:
+            merged[rule_id] = row
+        elif row["vote_score"] > merged[rule_id]["vote_score"]:
+            merged[rule_id] = row
+
+    ranked = sorted(
+        merged.values(),
+        key=lambda x: x.get("vote_score", 0),
+        reverse=True,
+    )
+
+    print("\n=== RULE VOTE RANKING ===")
+    for idx, row in enumerate(ranked, start=1):
+        print(
+            f"[{idx}] rule_id={row.get('rule_id')} | "
+            f"votes={row.get('vote_score')} | "
+            f"art_ref={row.get('art_ref')} | "
+            f"action={str(row.get('action', ''))[:60]}"
+        )
+
+    return ranked
+
+
+# ========== 8) Article Aggregation ==========
+
+
+def _aggregate_votes_by_article(
+    ranked_rules: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Aggregate rule vote scores up to the article level.
+    Normalizes by rule count so articles with many weak rules
+    don't outrank articles with few strong rules.
+
+    normalized_score = total_votes / rule_count
+
+    Example:
+        Rule 4:    total=18  count=2  normalized=9.0  ← wins
+        Article 3: total=36  count=17 normalized=2.1  ← drops
+    """
+    article_scores: dict[str, dict[str, Any]] = {}
+
+    for rule in ranked_rules:
+        art_ref = str(rule.get("art_ref", "") or "").strip()
+        if not art_ref:
+            continue
+
+        vote_score = int(rule.get("vote_score", 0) or 0)
+
+        if art_ref not in article_scores:
+            article_scores[art_ref] = {
+                "art_ref": art_ref,
+                "total_votes": 0,
+                "rule_count": 0,
+            }
+
+        article_scores[art_ref]["total_votes"] += vote_score
+        article_scores[art_ref]["rule_count"] += 1
+
+    # Normalize by rule count — penalizes articles that win only by volume
+    for art in article_scores.values():
+        art["normalized_score"] = art["total_votes"] / art["rule_count"]
+
+    ranked_articles = sorted(
+        article_scores.values(),
+        key=lambda x: x["normalized_score"],
+        reverse=True,
+    )
+
+    print("\n=== ARTICLE VOTE AGGREGATION ===")
+    for idx, article in enumerate(ranked_articles, start=1):
+        print(
+            f"[{idx}] art_ref={article['art_ref']} | "
+            f"total_votes={article['total_votes']} | "
+            f"rules_matched={article['rule_count']} | "
+            f"normalized={article['normalized_score']:.2f}"
+        )
+
+    return ranked_articles
+
+
+# ========== 9) Article Content Fetcher ==========
+
+
+def fetch_top_article_contents(
+    ranked_articles: list[dict[str, Any]],
+    top_n: int = 2,
+) -> list[dict[str, Any]]:
+    """
+    Take the top_n articles by normalized score,
+    fetch their full content from Neo4j.
+
+    Returns list of dicts: [{art_ref, content}, ...]
     """
     if driver is None:
         return []
+
+    art_refs = [a["art_ref"] for a in ranked_articles[:top_n] if a.get("art_ref")]
+
+    if not art_refs:
+        print("\n[article fetch] No art_refs to fetch.")
+        return []
+
+    print(f"\n=== FETCHING ARTICLE CONTENT ===")
+    print(f"Fetching top {top_n} articles: {art_refs}")
+
+    query = build_article_content_cypher()
+
+    with driver.session() as session:
+        records = session.run(query, {"art_refs": art_refs})
+        articles = [dict(record) for record in records]
+
+    print(f"Articles fetched: {len(articles)}")
+    for a in articles:
+        content_preview = str(a.get("content", "") or "")[:80]
+        print(f"  art_ref={a.get('art_ref')} | preview: {content_preview}...")
+
+    return articles
+
+
+# ========== 10) Retrieval ==========
+
+
+def get_relevant_articles(
+    params: dict[str, Any],
+    top_k: int = 10,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Full retrieval pipeline:
+    1. Run voting Cypher query against Rule nodes
+    2. Rank rules by weighted vote score (base tokens = 3x weight)
+    3. Aggregate rule votes up to article level
+    4. Normalize article scores by rule count
+    5. Fetch full content for top 2 articles
+
+    Returns:
+        ranked_rules     — top_k ranked Rule rows
+        ranked_articles  — articles sorted by normalized score
+        article_contents — full content of top 2 Article nodes
+    """
+    if driver is None:
+        return [], [], []
+
+    cypher_fetch_count = 0
+    query = build_voting_cypher()
+    base_tokens = params["base_tokens"]
+    all_tokens = params["all_tokens"]
+
+    print("\n=== RETRIEVAL PARAMS ===")
+    print(f"type (classifier): {params['type']}")
+    print(f"base_tokens: {base_tokens}")
+    print(f"token count: {len(all_tokens)}")
+    print(f"all_tokens : {all_tokens}")
 
     with driver.session() as session:
         records = session.run(query, params)
         rows = [dict(record) for record in records]
+    cypher_fetch_count += 1
+    print(f"\nCypher fetch #1 (Rule query) → {len(rows)} raw hits")
 
-    for row in rows:
-        row["source"] = source
+    # Rank rules by weighted vote score
+    ranked_rules = _rank_by_votes(rows, base_tokens, all_tokens)
 
-    return rows
+    # Aggregate and normalize votes at article level
+    ranked_articles = _aggregate_votes_by_article(ranked_rules)
 
+    # Fetch full content for top 2 articles
+    article_contents = fetch_top_article_contents(ranked_articles, top_n=2)
+    if article_contents:
+        cypher_fetch_count += 1
 
-def _merge_ranked_results(
-    typed_rows: list[dict[str, Any]],
-    broad_rows: list[dict[str, Any]],
-    entities: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """
-    Merge duplicates by rule_id and keep the higher-ranked version.
-    """
-    merged: dict[str, dict[str, Any]] = {}
+    print(f"\n=== CYPHER FETCH SUMMARY ===")
+    print(f"Total Cypher fetches this query: {cypher_fetch_count}")
+    print(f"  #1 — Rule nodes query")
+    if cypher_fetch_count >= 2:
+        print(f"  #2 — Article content fetch (top 2 art_refs)")
 
-    for row in typed_rows + broad_rows:
-        rule_id = str(row.get("rule_id", "") or "").strip()
-        if not rule_id:
-            continue
+    print(f"\nReturning top {top_k} rules, top 2 articles")
 
-        row["python_rank"] = _compute_python_rank(row, entities)
-
-        if rule_id not in merged:
-            merged[rule_id] = row
-            continue
-
-        if row["python_rank"] > merged[rule_id]["python_rank"]:
-            merged[rule_id] = row
-
-    return sorted(
-        merged.values(),
-        key=lambda x: (
-            x.get("python_rank", 0),
-            x.get("score", 0),
-            x.get("rule_id", ""),
-        ),
-        reverse=True,
-    )
+    return ranked_rules[:top_k], ranked_articles, article_contents
 
 
-def get_relevant_articles(
-    entities: dict[str, Any],
-    typed_query: str,
-    broad_query: str,
-    params: dict[str, Any],
-    top_k: int = 10,
-) -> list[dict[str, Any]]:
-    """
-    Run typed+broad retrieval, tag source, rank in Python, merge duplicates,
-    and return top-k rows.
-    """
-    if driver is None:
-        return []
-
-    print("\n=== RETRIEVAL INPUT ENTITIES ===")
-    print(json.dumps(entities, indent=2, ensure_ascii=False))
-
-    print("\n=== RETRIEVAL PARAMS ===")
-    print(json.dumps(params, indent=2, ensure_ascii=False))
-
-    print("\n=== RUNNING TYPED QUERY ===")
-    typed_rows = _run_query_with_source(typed_query, params, source="typed")
-    print(f"Typed hits: {len(typed_rows)}")
-
-    print("\n=== RUNNING BROAD QUERY ===")
-    broad_rows = _run_query_with_source(broad_query, params, source="broad")
-    print(f"Broad hits: {len(broad_rows)}")
-
-    ranked_rows = _merge_ranked_results(typed_rows, broad_rows, entities)
-
-    print("\n=== FINAL RANKED RESULTS ===")
-    for idx, row in enumerate(ranked_rows[:top_k], start=1):
-        print(
-            f"[{idx}] "
-            f"rule_id={row.get('rule_id')} | "
-            f"source={row.get('source')} | "
-            f"db_score={row.get('score')} | "
-            f"python_rank={row.get('python_rank')} | "
-            f"type={row.get('type')} | "
-            f"art_ref={row.get('art_ref')}"
-        )
-
-    return ranked_rows[:top_k]
+# ========== 11) Generation ==========
 
 
-# $$$$$$$$ NEW PART $$$$$$$$
-
-
-# $$$$$$$$ NEW PART $$$$$$$$
-
-
-def _format_rules_for_generation(
-    rule_results: list[dict[str, Any]], max_rules: int = 5
+def _format_articles_for_generation(
+    article_contents: list[dict[str, Any]],
 ) -> str:
-    """
-    Turn retrieved rule dicts into compact text context for the generator.
-    """
-    lines = []
+    if not article_contents:
+        return "No article content retrieved."
 
-    for i, rule in enumerate(rule_results[:max_rules], start=1):
+    lines = []
+    for i, article in enumerate(article_contents, start=1):
         lines.append(
-            f"""Rule {i}:
-- rule_id: {rule.get("rule_id", "")}
-- reg_name: {rule.get("reg_name", "")}
-- art_ref: {rule.get("art_ref", "")}
-- type: {rule.get("type", "")}
-- action: {rule.get("action", "")}
-- result: {rule.get("result", "")}
-- source: {rule.get("source", "")}
-- retrieval_score: {rule.get("python_rank", "")}
-"""
+            f"Article {i} (art_ref: {article.get('art_ref', '')}):\n"
+            f"{str(article.get('content', '') or '').strip()}\n"
         )
 
-    return "\n".join(lines)
-
-
-# $$$$$$$$ NEW PART $$$$$$$$
+    return "\n---\n".join(lines)
 
 
 def generate_text(messages: list[dict[str, str]], max_new_tokens: int = 220) -> str:
-    """
-    Call local HF model via chat template + raw pipeline.
-
-    Interface:
-    - Input:
-      - messages: list[dict[str, str]] (chat messages with role/content)
-      - max_new_tokens: int
-    - Output:
-      - str (model generated text, no JSON guarantee)
-    """
     tok = get_tokenizer()
     pipe = get_raw_pipeline()
 
@@ -824,25 +818,17 @@ def generate_text(messages: list[dict[str, str]], max_new_tokens: int = 220) -> 
     prompt = tok.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-
     return pipe(prompt, max_new_tokens=max_new_tokens)[0]["generated_text"].strip()
 
 
-# $$$$$$$$ NEW PART $$$$$$$$
-
-
-def generate_answer(question: str, rule_results: list[dict[str, Any]]) -> str:
+def generate_answer(
+    question: str,
+    article_contents: list[dict[str, Any]],
+) -> str:
     """
-    Generate a final answer from retrieved KG rule results.
-
-    Behavior:
-    - If no rules are retrieved, return a fallback answer.
-    - Otherwise, ask the local model to answer using only the provided rules.
+    Generate final answer using full Article content from top 2 ranked articles.
     """
-    if not rule_results:
-        return "I don't know based on the retrieved rules."
-
-    rules_context = _format_rules_for_generation(rule_results, max_rules=5)
+    articles_context = _format_articles_for_generation(article_contents)
 
     messages = [
         {
@@ -850,17 +836,17 @@ def generate_answer(question: str, rule_results: list[dict[str, Any]]) -> str:
             "content": """
 You are a careful regulation QA assistant.
 
-- Answer the user's question using ONLY the retrieved rules provided.
-Do not invent facts.
-- If the rule gives a partial answer, explain the limitation
-- Do NOT default to "I don't know" if some relevant rule exists
-- Only say "I don't know" if no relevant rule exists at all
+- Answer the user's question using ONLY the retrieved article content provided.
+- Do not invent facts.
+- If the article gives a partial answer, explain the limitation.
+- Do NOT default to "I don't know" if some relevant content exists.
+- Only say "I don't know" if no relevant content exists at all.
 
 Instructions:
-- Prefer the highest-ranked and most directly relevant rule.
-- If multiple rules are relevant, synthesize them briefly.
+- Prefer the most directly relevant article.
+- If both articles are relevant, synthesize them briefly.
 - Cite the supporting source at the end in this format:
-  [Source: <reg_name>, <art_ref>]
+  [Source: <art_ref>]
 - If more than one source is used, include multiple citations.
 - Be concise and direct.
 """.strip(),
@@ -871,77 +857,79 @@ Instructions:
 Question:
 {question}
 
-Retrieved rules:
-{rules_context}
+Retrieved article content:
+{articles_context}
 
 Write the final answer.
 """.strip(),
         },
     ]
 
-    answer = generate_text(messages, max_new_tokens=220)
-    return answer.strip()
+    return generate_text(messages, max_new_tokens=220).strip()
 
 
-# $$$$$$$$ NEW PART $$$$$$$$
+# ========== 12) Main Pipeline ==========
 
 
-# $$$$ NEW CODE $$$$
-def answer_question(user_q: str, profile: str, schema_description: str) -> str:
+def answer_question(user_q: str) -> str:
     """
-    Wrap full pipeline:
-    classify → build queries → retrieve → generate answer
+    Full pipeline:
+    1. Classify type only (LLM — one word output)
+    2. Tokenize raw question — stopwords removed (expanded set)
+    3. Expand tokens — specific tokens first, generic last
+    4. Check DB connectivity — fail fast if unavailable
+    5. Voting Cypher query against Rule nodes
+    6. Rank rules by weighted vote score (base tokens = 3x)
+    7. Aggregate rule votes up to article level, normalize by rule count
+    8. Fetch top 2 articles by normalized score
+    9. Generate answer from raw question + full article content
     """
-    entities = classify_user_input(
-        user_input=user_q,
-        profile=profile,
-        schema_description=schema_description,
+
+    # Step 1 — type only
+    question_type = classify_type(user_q)
+
+    # Step 2+3 — tokenize raw question + expand (specific tokens first)
+    params = build_voting_params(
+        user_q=user_q,
+        question_type=question_type,
+        max_total=MAX_EXPANDED_TOKENS,
     )
 
-    typed_query, broad_query = build_typed_cypher(entities)
-    params = build_typed_params(entities)
+    # Step 4 — fail fast if DB unavailable
+    if driver is None:
+        return "Unable to answer: database is not connected."
 
-    relevant_rules = get_relevant_articles(
-        entities=entities,
-        typed_query=typed_query,
-        broad_query=broad_query,
+    # Step 5+6+7+8 — retrieve, rank, aggregate, fetch
+    ranked_rules, ranked_articles, article_contents = get_relevant_articles(
         params=params,
         top_k=10,
     )
 
+    # Step 9 — no results found
+    if not article_contents:
+        return "No relevant articles were found for your question."
+
+    # Step 10 — generate from raw question + full article content
     return generate_answer(
         question=user_q,
-        rule_results=relevant_rules,
+        article_contents=article_contents,
     )
 
 
-# $$$$ NEW CODE $$$$
+# ========== 13) Entry Point ==========
 
-
-# $$$$ NEW CODE $$$$
 if __name__ == "__main__":
     if driver is None:
         print("\n❌ Neo4j driver is NOT connected. Exiting.\n")
     else:
         load_local_llm()
 
-        profile = (
-            "Classify the user request into exactly one legal-style category "
-            "and summarize the action and result under the required schema."
-        )
-
-        schema_description = """
-{
-  "type": "choose exactly one of: eligibility, requirement, prohibition, permission, process, penalty , exception , calculation , definition",
-  "action": "6 or less words",
-  "result": "6 or less words, if not possible use empty string"
-}
-""".strip()
-
         print("=" * 50)
         print("🎓 NCU Regulation Assistant")
         print("=" * 50)
-        print("💡 Try: 'What is the penalty for forgetting student ID?'")
+        print(
+            "💡 Try: 'How many minutes late can a student be before they are barred from the exam?'"
+        )
         print("👉 Type 'exit' to quit.\n")
 
         while True:
@@ -955,10 +943,7 @@ if __name__ == "__main__":
                     print("👋 Bye!")
                     break
 
-                # $$$$ NEW CODE $$$$
-                answer = answer_question(user_q, profile, schema_description)
-                # $$$$ NEW CODE $$$$
-
+                answer = answer_question(user_q)
                 print(f"\nBot: {answer}")
 
             except KeyboardInterrupt:
@@ -969,4 +954,3 @@ if __name__ == "__main__":
                 break
             except Exception as e:
                 print(f"❌ Error: {e}")
-# $$$$ NEW CODE $$$$s
