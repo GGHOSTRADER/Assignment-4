@@ -280,9 +280,7 @@ def classify_type(user_input: str) -> str:
     prompt = build_type_classification_prompt(user_input)
     response_text = call_llm_once(prompt)
 
-    print("\n--- TYPE CLASSIFICATION OUTPUT ---")
-    print(response_text)
-    print("----------------------------------\n")
+    -------------------------\n")
 
     try:
         data = parse_json_text(response_text)
@@ -612,17 +610,7 @@ def _rank_by_votes(
         reverse=True,
     )
 
-    print("\n=== RULE RANKING (vote + embedding) ===")
-    for idx, row in enumerate(ranked, start=1):
-        print(
-            f"[{idx}] rule_id={row.get('rule_id')} | "
-            f"final={row.get('final_score', 0.0):.4f} | "
-            f"norm_vote={row.get('norm_vote', 0.0):.3f} | "
-            f"embed={row.get('embedding_score', 0.0):.3f} | "
-            f"base_hits={row.get('base_hit_count')} | "
-            f"art_ref={row.get('art_ref')} | "
-            f"action={str(row.get('action', ''))[:60]}"
-        )
+    
 
     return ranked
 
@@ -667,14 +655,7 @@ def _aggregate_votes_by_article(
         reverse=True,
     )
 
-    print("\n=== ARTICLE AGGREGATION (blended scores) ===")
-    for idx, article in enumerate(ranked_articles, start=1):
-        print(
-            f"[{idx}] art_ref={article['art_ref']} | "
-            f"total_score={article['total_score']:.4f} | "
-            f"rules_matched={article['rule_count']} | "
-            f"normalized={article['normalized_score']:.4f}"
-        )
+    
 
     return ranked_articles
 
@@ -768,7 +749,7 @@ def get_relevant_articles(
     print(f"Total Cypher fetches this query: {cypher_fetch_count}")
     print(f"  #1 — Rule nodes query (whole-word regex + embeddings returned)")
     if cypher_fetch_count >= 2:
-        print(f"  #2 — Article content fetch (top 2 art_refs)")
+        print(f"  #2 — Article content fetch (top 4 art_refs)")
 
     
     return ranked_rules[:top_k], ranked_articles, article_contents
