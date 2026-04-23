@@ -1,5 +1,6 @@
 
 Files run as requested
+0) Must install requirements.
 
 1) setup_data.py will build the SQLite DB 
     needs the folder sources to build the DB as it does in the original repo.
